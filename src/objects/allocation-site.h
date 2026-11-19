@@ -1,0 +1,168 @@
+// Copyright 2018 the V8 project authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+#ifndef V8_OBJECTS_ALLOCATION_SITE_H_
+#define V8_OBJECTS_ALLOCATION_SITE_H_
+
+#include <cstddef>
+#include <cstring>
+#include <type_traits>
+
+#include "src/base/bits.h"
+#include "src/objects/objects.h"
+#include "src/objects/struct.h"
+
+// Has to be the last include (doesn't have include guards):
+#include "src/objects/object-macros.h"
+
+namespace v8 {
+namespace internal {
+
+enum InstanceType : uint16_t;
+
+V8_OBJECT class AllocationSite : public HeapObject {
+  V8_IT_OWN_TYPE;
+  V8_IT_NO_AUTO_DISPATCH;
+
+ public:
+  static const uint32_t kMaximumArrayBytesToPretransition = 8 * 1024;
+
+  inline Tagged<UnionOf<Smi, JSObject>> transition_info_or_boilerplate() const;
+
+  inline Tagged<JSObject> boilerplate() const;
+  inline Tagged<JSObject> boilerplate(AcquireLoadTag tag) const;
+  inline void set_boilerplate(Tagged<JSObject> value, ReleaseStoreTag,
+                              WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+
+  inline int transition_info() const;
+  inline void set_transition_info(int value);
+
+  // nested_site threads a list of sites that represent nested literals
+  // walked in a particular order. So [[1, 2], 1, 2] will have one
+  // nested_site, but [[1, 2], 3, [4]] will have a list of two.
+  inline Tagged<UnionOf<Smi, AllocationSite>> nested_site() const;
+  inline void set_nested_site(Tagged<UnionOf<Smi, AllocationSite>> value,
+                              WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+
+  inline Tagged<DependentCode> dependent_code() const;
+  inline void set_dependent_code(Tagged<DependentCode> value,
+                                 WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+
+  inline void Initialize();
+
+  // transition_info bitfields, for constructed array transition info.
+  using ElementsKindBits = base::BitField<ElementsKind, 0, 6>;
+  using SpeculationDisabledBit = base::BitField<bool, 6, 1>;
+  // Unused bits 7-30.
+
+  inline ElementsKind GetElementsKind() const;
+  inline void SetElementsKind(ElementsKind kind);
+
+  // The IsSpeculationDisabled flag is only used for the Array constructor, and
+  // protects against deopt loops due to speculative optimizations.
+  inline bool IsSpeculationDisabled() const;
+  inline void SetSpeculationDisabled();
+
+  inline bool PointsToLiteral() const;
+
+  template <AllocationSiteUpdateMode update_or_check =
+                AllocationSiteUpdateMode::kUpdate>
+  static bool DigestTransitionFeedback(Isolate* isolate,
+                                       DirectHandle<AllocationSite> site,
+                                       ElementsKind to_kind);
+
+  DECL_PRINTER(AllocationSite)
+  DECL_VERIFIER(AllocationSite)
+
+  static inline bool ShouldTrack(ElementsKind boilerplate_elements_kind);
+  static bool ShouldTrack(ElementsKind from, ElementsKind to);
+  static inline bool CanTrack(InstanceType type);
+
+  class BodyDescriptor;
+
+ private:
+  friend class CodeStubAssembler;
+  friend class ArrayBuiltinsAssembler;
+  friend class V8HeapExplorer;
+
+  // Contains either a Smi-encoded bitfield or a boilerplate. If it's a Smi the
+  // AllocationSite is for a constructed Array.
+  TaggedMember<UnionOf<Smi, JSObject>> transition_info_or_boilerplate_;
+  TaggedMember<UnionOf<Smi, AllocationSite>> nested_site_;
+  TaggedMember<DependentCode> dependent_code_;
+} V8_OBJECT_END;
+
+// Direct-mapped cache of (JSArray address -> AllocationSite address) for
+// elements transition tracking. Cleared on every GC prologue.
+//
+// 256 entries (2 KB with pointer compression or 32-bit, 4 KB on 64-bit
+// uncompressed):
+// - Size rationale: keeps per-Isolate footprint small and GC-prologue clearing
+//   (`memset`) fast.
+// - Low eviction rate: only CSA/runtime young JSArray allocations with an
+//   active AllocationSite write to the cache, and ElementsKind transitions
+//   typically follow allocation immediately. For batch allocations, only a
+//   single surviving entry needs to hit to permanently generalize the site.
+// - On collision/eviction: direct-mapped slots overwrite unconditionally. A tag
+//   mismatch (`entry.object != object`) on lookup misses the cache, skipping
+//   the speculative AllocationSite update for that instance while the JSArray
+//   transitions its own map normally.
+class V8_EXPORT_PRIVATE AllocationSiteCache {
+ public:
+  struct Entry {
+    Tagged_t object = kNullAddress;
+    Tagged_t site = kNullAddress;
+  };
+  static_assert(sizeof(Entry) == 2 * kTaggedSize);
+  static_assert(std::has_unique_object_representations_v<Entry>);
+  static_assert(offsetof(Entry, object) == 0);
+  static_assert(offsetof(Entry, site) == kTaggedSize);
+
+  static constexpr int kSize = 256;
+  static_assert(base::bits::IsPowerOfTwo(kSize));
+  static constexpr int kMask = kSize - 1;
+  static constexpr int kShift1 = 3;
+  static constexpr int kShift2 = 11;
+
+  AllocationSiteCache() = default;
+  AllocationSiteCache(const AllocationSiteCache&) = delete;
+  AllocationSiteCache& operator=(const AllocationSiteCache&) = delete;
+
+  static inline AllocationSiteCache* New();
+  static inline void Delete(AllocationSiteCache* cache);
+
+  // Maps a tagged JSArray address to a slot in [0, 255]:
+  // - `>> 3` drops bits [2:0] (tag bit 0 and sub-8B offset bits [2:1];
+  //   JSArray::kHeaderSize >= 16 even when kObjectAlignmentBits == 2), using
+  //   bits [10:3] to index 8-byte words across a 2 KB window.
+  // - `^ (addr >> 11)` XOR-folds bits [18:11] into [10:3] so 16-byte-strided
+  //   allocations (e.g. 16B empty JSArrays under pointer compression) flip bit
+  //   0 at 2 KB boundaries and populate odd as well as even slots, while
+  //   breaking power-of-two stride aliasing across a 512 KB range.
+  // - `& 0xff` masks to the 256-entry direct-mapped table.
+  static inline size_t ComputeIndex(Tagged<JSArray> object);
+
+  inline void Update(Tagged<JSArray> object, Tagged<AllocationSite> site);
+  inline bool Lookup(Tagged<JSArray> object,
+                     Tagged<AllocationSite>* site_out) const;
+
+  void Clear() { std::memset(entries_, 0, sizeof(entries_)); }
+
+#ifdef VERIFY_HEAP
+  void Verify() const;
+#endif
+
+ private:
+  static inline Tagged_t Compress(Tagged<HeapObject> object);
+  static inline Address Decompress(Tagged_t raw_value);
+
+  Entry entries_[kSize] = {};
+};
+
+}  // namespace internal
+}  // namespace v8
+
+#include "src/objects/object-macros-undef.h"
+
+#endif  // V8_OBJECTS_ALLOCATION_SITE_H_

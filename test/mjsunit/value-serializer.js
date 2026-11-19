@@ -1,0 +1,135 @@
+// Copyright 2022 the V8 project authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+// Test the basic d8 value serializer interface
+// Flags: --js-staging
+
+var largeArray = [];
+largeArray[0xFFFF00] = 123;
+
+let proto_obj = { fn1() { return 1 } }
+let obj_with_enum_cache = {
+  __proto__: proto_obj,
+  a: 1,
+  b: 2,
+  c: "c"
+};
+
+for (let k in obj_with_enum_cache) {
+  // do something
+  obj_with_enum_cache.a += obj_with_enum_cache.fn1();
+}
+let string_1 = "aasdfasdfasdfasdf asd fa sdf asdf as dfa sdf asd f"
+let string_2 = "aasdfasdfasdfasdf asd fa sdf UC16\u2028asdf as dfa sdf asd f"
+var objects = [
+    true, false, null, undefined,
+    1, -1, 1.1, -2.2, -0, 0,
+    9007199254740991.0, 9007199254740991.0 + 10,
+    -9007199254740992.0, -9007199254740992.0 - 10,
+    Infinity, -Infinity, NaN,
+    string_1, string_1+"b", string_1.slice(1),
+    string_2, string_2+"b", string_2.slice(1),
+    {}, {1:1}, {a:1}, {1:1, 2:2}, Object.create(null),
+    obj_with_enum_cache,
+    [], [{}, {}], [1, 1, 1], [1.1, 1.1, 1.1, 1.1, 2], largeArray,
+    // new Proxy({},{}),
+    new Date(), new String(" a"),
+    new Uint8Array(12), new Float16Array([1, 2, 3, 4, 5]),
+    new Float16Array([NaN, Infinity, -Infinity]),
+    new Float32Array([1, 2, 4, 5]),
+    new Uint8ClampedArray(2048),
+    /asdf/, new RegExp(),
+    new Map(), new Set(),
+
+];
+
+for (var o of objects) {
+  const serialised = d8.serializer.serialize(o)
+  const deserialised = d8.serializer.deserialize(serialised);
+  assertEquals(typeof deserialised, typeof o);
+}
+
+{
+  const map = new Map([
+    ['foo', 42],
+    ['bar' + 'baz', 99],
+    ['uc16\u2028key', 123],
+    [-0.0, 'zero'],
+    [1.5, 'one_half'],
+    [-2.5, 'minus_two_half'],
+    [NaN, 'nan'],
+  ]);
+  const deserialized = d8.serializer.deserialize(d8.serializer.serialize(map));
+  assertEquals(7, deserialized.size);
+  assertTrue(deserialized.has('foo'));
+  assertEquals(42, deserialized.get('foo'));
+  assertTrue(deserialized.has('barbaz'));
+  assertEquals(99, deserialized.get('barbaz'));
+  assertTrue(deserialized.has('uc16\u2028key'));
+  assertEquals(123, deserialized.get('uc16\u2028key'));
+  assertTrue(deserialized.has(0.0));
+  assertTrue(deserialized.has(-0.0));
+  assertEquals('zero', deserialized.get(0.0));
+  assertEquals('zero', deserialized.get(-0.0));
+  assertTrue(deserialized.has(1.5));
+  assertEquals('one_half', deserialized.get(1.5));
+  assertTrue(deserialized.has(-2.5));
+  assertEquals('minus_two_half', deserialized.get(-2.5));
+  assertTrue(deserialized.has(NaN));
+  assertEquals('nan', deserialized.get(NaN));
+  assertTrue(deserialized.delete('foo'));
+  assertFalse(deserialized.has('foo'));
+  assertEquals(6, deserialized.size);
+}
+
+{
+  const set = new Set([
+    'foo',
+    'bar' + 'baz',
+    'uc16\u2028key',
+    -0.0,
+    0.0,
+    1.5,
+    -2.5,
+    NaN,
+  ]);
+  const deserialized = d8.serializer.deserialize(d8.serializer.serialize(set));
+  assertEquals(7, deserialized.size);
+  assertTrue(deserialized.has('foo'));
+  assertTrue(deserialized.has('barbaz'));
+  assertTrue(deserialized.has('uc16\u2028key'));
+  assertTrue(deserialized.has(0.0));
+  assertTrue(deserialized.has(-0.0));
+  assertTrue(deserialized.has(1.5));
+  assertTrue(deserialized.has(-2.5));
+  assertTrue(deserialized.has(NaN));
+  assertTrue(deserialized.delete('foo'));
+  assertFalse(deserialized.has('foo'));
+  assertEquals(6, deserialized.size);
+}
+
+// Crafted wire payloads encoding -0.0 (kDouble) directly as a Map or Set key
+// should fail deserialization rather than CHECK-failing.
+{
+  const serializedMinusZero = new Uint8Array(d8.serializer.serialize(-0.0));
+  const header = serializedMinusZero.slice(0, 2);
+  const minusZeroDouble = serializedMinusZero.slice(2);
+
+  const setBytes = new Uint8Array([
+    ...header,
+    0x27,  // SerializationTag::kBeginJSSet ("'")
+    ...minusZeroDouble,
+    0x2c, 1,  // SerializationTag::kEndJSSet (","), length 1
+  ]);
+  assertThrows(() => d8.serializer.deserialize(setBytes.buffer), Error);
+
+  const mapBytes = new Uint8Array([
+    ...header,
+    0x3b,  // SerializationTag::kBeginJSMap (";")
+    ...minusZeroDouble,
+    0x54,  // SerializationTag::kTrue ("T")
+    0x3a, 2,  // SerializationTag::kEndJSMap (":"), length 2
+  ]);
+  assertThrows(() => d8.serializer.deserialize(mapBytes.buffer), Error);
+}

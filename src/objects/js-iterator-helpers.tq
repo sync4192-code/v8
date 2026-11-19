@@ -1,0 +1,106 @@
+// Copyright 2023 the V8 project authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+// Iterator helpers are specced as generators but implemented as direct
+// iterators. As such, generator states need to be tracked manually.
+extern enum JSIteratorHelperState extends uint31 {
+  kSuspendedStart,
+  kSuspendedYield,
+  kExecuting,
+  kCompleted
+}
+
+@abstract
+@cppObjectLayoutDefinition
+extern class JSIteratorHelper extends JSObject {
+  state: SmiTagged<JSIteratorHelperState>;
+}
+
+@abstract
+@cppObjectLayoutDefinition
+extern class JSIteratorHelperSimple extends JSIteratorHelper {
+  underlying_iterator: iterator::IteratorRecord;
+}
+
+@cppObjectLayoutDefinition
+extern class JSIteratorMapHelper extends JSIteratorHelperSimple {
+  mapper: Callable;
+  counter: Number;
+}
+
+@cppObjectLayoutDefinition
+extern class JSIteratorFilterHelper extends JSIteratorHelperSimple {
+  predicate: Callable;
+  counter: Number;
+}
+
+@cppObjectLayoutDefinition
+extern class JSIteratorTakeHelper extends JSIteratorHelperSimple {
+  remaining: Number;
+}
+
+@cppObjectLayoutDefinition
+extern class JSIteratorDropHelper extends JSIteratorHelperSimple {
+  remaining: Number;
+}
+
+@cppObjectLayoutDefinition
+extern class JSIteratorFlatMapHelper extends JSIteratorHelperSimple {
+  mapper: Callable;
+  counter: Number;
+  inner_iterator: iterator::IteratorRecord;
+}
+
+@cppObjectLayoutDefinition
+extern class JSIteratorConcatHelper extends JSIteratorHelperSimple {
+  iterables: FixedArray;
+  current: Smi;
+}
+
+extern enum JSIteratorZipHelperMode extends uint31 {
+  kShortest,
+  kLongest,
+  kStrict
+}
+
+@cppObjectLayoutDefinition
+extern class JSIteratorZipHelper extends JSIteratorHelper {
+  underlying_iterators: FixedArray;
+  mode: SmiTagged<JSIteratorZipHelperMode>;
+  active_count: Smi;
+  padding: FixedArray;
+}
+
+@cppObjectLayoutDefinition
+extern class JSIteratorZipKeyedHelper extends JSIteratorZipHelper {
+  keys: FixedArray;
+}
+
+extern enum JSIteratorWindowsHelperMode extends uint31 {
+  kOnlyFull,
+  kAllowPartial
+}
+
+@cppObjectLayoutDefinition
+extern class JSIteratorChunksHelper extends JSIteratorHelperSimple {
+  chunk_size: Smi;
+}
+
+@cppObjectLayoutDefinition
+extern class JSIteratorWindowsHelper extends JSIteratorHelperSimple {
+  window_size: Smi;
+  mode: SmiTagged<JSIteratorWindowsHelperMode>;
+  // The `buffer` stores `element_count` current window elements, starting at
+  // `start_index`, using one of three strategies based on `window_size`:
+  // - For `window_size == 1`, the `buffer` is not used.
+  // - For `1 < window_size <= 1024`, the `buffer` grows up to
+  //   `max(2 * window_size - 1, 16)` and stores elements contiguously at
+  //   `[start_index, start_index + element_count)`. When the end of `buffer` is
+  //   reached, elements are shifted back to index 0.
+  // - For `window_size > 1024`, the `buffer` grows up to `window_size` and acts
+  //   as a circular buffer.
+  buffer: FixedArray;
+  element_count: Smi;
+  start_index: Smi;
+}
