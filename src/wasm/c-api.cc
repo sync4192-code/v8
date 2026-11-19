@@ -24,7 +24,6 @@
 #include <cstring>
 #include <iomanip>
 #include <iostream>
-#include <optional>
 
 #include "include/libplatform/libplatform.h"
 #include "include/v8-initialization.h"
@@ -106,21 +105,14 @@ namespace {
 // For all other configurations this scope is a no-op.
 using PtrComprCageAccessScope = i::PtrComprCageAccessScope;
 
-// Reads a LEB-128-encoded uint64 from [*pos, end).
-// Returns std::nullopt if the encoding is truncated (would read past `end`),
-// or if more than 10 bytes are consumed (malformed / overlong encoding).
-// On success advances *pos past the consumed bytes.
-auto ReadLebU64(const byte_t** pos, const byte_t* end)
-    -> std::optional<uint64_t> {
+auto ReadLebU64(const byte_t** pos) -> uint64_t {
   uint64_t n = 0;
   uint64_t shift = 0;
   byte_t b;
   do {
-    if (*pos >= end) return std::nullopt;  // truncated encoding
-    if (shift >= 64) return std::nullopt;  // overlong / malformed encoding
     b = **pos;
     (*pos)++;
-    n += static_cast<uint64_t>(b & 0x7f) << shift;
+    n += (b & 0x7f) << shift;
     shift += 7;
   } while ((b & 0x80) != 0);
   return n;
@@ -1374,16 +1366,8 @@ WASM_EXPORT auto Module::deserialize(Store* store_abs,
   v8::Isolate::Scope isolate_scope(store->isolate());
   i::HandleScope handle_scope(isolate);
   const byte_t* ptr = serialized.get();
-  const byte_t* end = serialized.get() + serialized.size();
-  auto binary_size_opt = ReadLebU64(&ptr, end);
-  if (!binary_size_opt.has_value()) return nullptr;
-  size_t binary_size = static_cast<size_t>(*binary_size_opt);
+  size_t binary_size = static_cast<size_t>(ReadLebU64(&ptr));
   ptrdiff_t size_size = ptr - serialized.get();
-  // Guard against size_t underflow: the LEB header plus the wire bytes must
-  // fit within the supplied buffer before we compute serial_size.
-  if (static_cast<size_t>(size_size) + binary_size > serialized.size()) {
-    return nullptr;
-  }
   size_t serial_size = serialized.size() - size_size - binary_size;
   v8::base::UniqueArray<const uint8_t> wire_bytes = v8::base::UniqueCopyOf(
       reinterpret_cast<const uint8_t*>(ptr), binary_size);
