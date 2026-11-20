@@ -117,6 +117,45 @@ If the cache entry was written by the attacker, V8 uses the poisoned blob.
 
 ---
 
+## Arbitrary Shellcode Injection (PoC 2)
+
+**File**: `shellcode_poc.js`  
+**Run**: `node --allow-natives-syntax shellcode_poc.js`
+
+The cross-module injection primitive extends to arbitrary x86-64 shellcode.
+By constructing a minimal wasm blob where `code_data` contains hand-written
+machine code (not compiled by TurboFan), we can inject any payload:
+
+```
+=== ARBITRARY SHELLCODE INJECTION PoC ===
+Searching for stack guard check (49 3b 65 a0 0f 86) at offset 64...
+  Found at offset 64, patchOff=74
+Searching for epilogue (48 8b e5 5d c3) at offset 100+...
+  Found at offset 111
+
+Injecting shellcode: mov eax,1337 + jmp epilogue
+Result: g() returned: 1337
+
+╔════════════════════════════════════════╗
+║  ARBITRARY SHELLCODE CONFIRMED         ║
+║  g() = 1337 (not wasm bytecode value)  ║
+╚════════════════════════════════════════╝
+```
+
+### Key insight
+
+The 4-byte trailing value per function in V8 12.4's blob is a **call counter
+(tiering budget)**, not a cryptographic hash of the machine code.  Chrome's wasm
+code cache (`Default/Code Cache/pc/`) contains no additional integrity check on
+the raw `code_data` bytes.
+
+This means any blob with the correct structural headers (magic, version hash,
+cpu_features, function count) will pass validation regardless of the actual
+machine code it contains.  An attacker can place arbitrary x86-64 shellcode in
+`code_data` and V8 will execute it in the renderer process.
+
+---
+
 ## Real-World Attack Scenario
 
 1. Attacker compromises a CDN edge, service worker, or HTTP cache layer that
@@ -150,6 +189,53 @@ the payload:
   that returns a fixed value, breaking application security without memory corruption.
 - **Information disclosure**: Machine code that leaks stack/heap pointers into a
   wasm global or memory location.
+
+---
+
+## CDN Cache Poisoning Attack Analysis
+
+The most impactful web-reachable attack path would be a CDN cache poisoning
+attack where an adversary manipulates the HTTP response served from a CDN to
+inject a poisoned wasm code cache entry.
+
+### Chrome's wasm code cache key
+
+Chrome's `Default/Code Cache/pc/*.db` SQLite stores:
+- `key` — resource URL
+- `input_signature` — an `int64` derived from the response timestamp
+- `content` — the serialized wasm native module blob
+
+The `input_signature` is computed from the **response receipt time**
+(`base::Time::Now()` in the network stack), **not** the HTTP `Date` header.
+
+Sources (Chromium):
+- `net/http/http_stream_parser.cc:922`: `response_time = base::Time::Now()` on header receipt
+- `content/browser/renderer_host/code_cache_host_impl.cc:706`:
+  `input_signature = expected_response_time.ToDeltaSinceWindowsEpoch().InMicroseconds()`
+
+### Why CDN Date-header poisoning does not work
+
+| Factor | Detail |
+|---|---|
+| `input_signature` derivation | Receipt time (µs since Windows epoch), not `Date:` header |
+| Phase 2 test | `g()=42` — VICTIM recompiled fresh, no injection |
+| Test setup | Fixed `Date: Wed, 20 Nov 2026 10:00:00 GMT` both phases; different receipt times |
+| Conclusion | Phase 2 sig ≠ Phase 1 sig → cache miss → safe recompile |
+
+The test was run with `Cache-Control: no-store` and `Cache-Control: max-age=3600`,
+single-session (same Chrome process), and two separate Chrome sessions — all
+producing `g()=42`, confirming VICTIM was always compiled from its own wire bytes.
+
+### Remaining attack surfaces
+
+The injection does apply when an attacker controls:
+1. **Service worker** — can intercept `fetch()` and serve a poisoned response
+   body for the wasm URL, plus modify or fake the metadata passed to the cache
+2. **Compromised renderer** (same-origin) — can call `caches.put()` with a
+   fabricated `CacheStorage` entry
+3. **Physical/file-system access** — can swap the SQLite `pc/` database directly
+
+These require a prior compromise and do not constitute a "from web content" RCE.
 
 ---
 
