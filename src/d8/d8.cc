@@ -3615,7 +3615,23 @@ void Shell::WasmDeserializeModule(
       reinterpret_cast<uint8_t*>(serialized_bytes_buffer->Data()),
       serialized_bytes_buffer->ByteLength());
 
-  // Hash guard removed for PoC testing (was fuzzer-only barrier, not VRP-eligible).
+  // Check that we only try to deserialize bytes that we previously produced via
+  // serialization.
+  // This is prone to hash collisions, but this check sufficiently prevents
+  // fuzzers from passing manipulated bytes (or bytes that do not match the wire
+  // bytes) in regular fuzzing.
+  {
+    size_t hash = base::Hasher{}
+                      .Add(wire_bytes_vec.size())
+                      .AddRange(wire_bytes_vec.as_span())
+                      .AddRange(serialized_bytes_vec.as_span())
+                      .hash();
+    base::MutexGuard mutex_guard(Shell::wasm_serialized_bytes_mutex_.Pointer());
+    if (!Shell::wasm_serialized_bytes_hashes_.count(hash)) {
+      ThrowError(isolate, "Trying to deserialize manipulated bytes");
+      return;
+    }
+  }
 
   i::DirectHandle<i::WasmModuleObject> module_object;
 
