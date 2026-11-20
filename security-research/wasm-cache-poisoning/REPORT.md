@@ -226,16 +226,79 @@ The test was run with `Cache-Control: no-store` and `Cache-Control: max-age=3600
 single-session (same Chrome process), and two separate Chrome sessions — all
 producing `g()=42`, confirming VICTIM was always compiled from its own wire bytes.
 
-### Remaining attack surfaces
+### Blink wire-byte SHA-256 layer (additional browser protection)
 
-The injection does apply when an attacker controls:
-1. **Service worker** — can intercept `fetch()` and serve a poisoned response
-   body for the wasm URL, plus modify or fake the metadata passed to the cache
-2. **Compromised renderer** (same-origin) — can call `caches.put()` with a
-   fabricated `CacheStorage` entry
+Chrome's Blink layer (`blink/renderer/bindings/core/v8/v8_wasm_response_extensions.cc`)
+adds a second layer of protection **above** V8's deserializer:
+
+```
+CachedMetadata layout for wasm (Blink):
+  [kWireBytesDigestSize = 32 bytes]  SHA-256 of wire bytes  ← added/checked by Blink
+  [remainder]                         V8's internal blob     ← read by wasm-serialization.cc
+```
+
+On **store**: Blink computes SHA-256 over the module's wire bytes, prepends it to V8's
+serialized blob, and stores the concatenation in the HTTP code cache.
+
+On **consume**: Blink recomputes SHA-256 of the current wire bytes and compares with the
+stored 32-byte digest. **If they differ, Blink discards the cache entry and falls back to
+fresh compilation** — before V8's `DeserializeNativeModule` is ever called.
+
+This means Chrome's HTTP code cache path is **also protected against cross-module injection**
+at the browser level, independent of V8's internal validation.
+
+### Why Service Worker wasm cache poisoning does not work
+
+Chromium issue [547815507](https://issues.chromium.org/issues/547815507) explicitly states:
+> "Wasm is unaffected since it always hashes the cached objects."
+
+A malicious Service Worker that intercepts wasm `fetch()` and injects POISONER's bytes would
+cause Chrome to store a code cache entry keyed on POISONER's SHA-256. When the page later
+requests VICTIM, Blink recomputes VICTIM's SHA-256 (different), detects the mismatch, discards
+the poisoned entry, and recompiles VICTIM from its actual wire bytes → `g()=42`, no injection.
+
+The SW bugs ([547815507](https://issues.chromium.org/issues/547815507),
+[558367547](https://issues.chromium.org/issues/558367547), CVE-2026-91709, CVE-2026-91715)
+affect **JavaScript** code cache through `ScriptCacheConsumer`, not wasm, because wasm's
+Blink-layer SHA-256 check runs earlier in the consume path.
+
+### Why our V8-level PoC bypasses all browser protection
+
+`%DeserializeWasmModule(blob, wire_bytes)` is V8's **internal** API, accessed via
+`--allow-natives-syntax`. It calls `DeserializeNativeModule()` directly, completely
+**bypassing Blink's 32-byte SHA-256 wrapper**. V8's own `ReadCode()` never sees the wire
+bytes at all — it only validates the machine-code-only hash within the blob.
+
+| Check | Blink HTTP cache path | V8 `%DeserializeWasmModule` |
+|---|---|---|
+| URL + response_time match | ✅ Yes | N/A |
+| Wire-byte SHA-256 (Blink layer) | ✅ Yes | ❌ Bypassed entirely |
+| Machine-code-only hash (V8 layer) | ✅ Runs if Blink passes | ✅ Checked |
+| Wire-byte → machine-code binding | ❌ **Missing** | ❌ **Missing** |
+
+The last row is the root bug at the **V8 layer**: both paths lack a check that the machine
+code was compiled from the wire bytes being loaded. Blink compensates for this by adding its
+own SHA-256 guard, but only on the HTTP cache path — not on direct V8 API access.
+
+### Companion Chromium report
+
+Chromium bug [482768085](https://issues.chromium.org/issues/482768085) ("WASM deserialization
+DCHECK-only validation — attacker-controlled native code copied to JIT executable pages via
+CopyCode()") identifies the same root cause from a different angle: `ReadCode()` size-field
+validation uses DCHECK only (stripped in release builds), and `CopyCode()` copies
+attacker-controlled bytes directly into `WritableJitAllocation` pages. Our shellcode PoC
+(`g()=1337`) confirms this code path experimentally.
+
+### Remaining attack surfaces (requires prior compromise)
+
+The injection does apply when an attacker already has:
+1. **Node.js / `--allow-natives-syntax`** — calls `%DeserializeWasmModule` directly,
+   bypassing Blink's SHA-256 guard entirely (our PoC)
+2. **Compromised renderer** — can call `caches.put()` with fabricated `CacheStorage`
+   entry and pass a poisoned buffer directly to `WebAssembly.compile()`
 3. **Physical/file-system access** — can swap the SQLite `pc/` database directly
 
-These require a prior compromise and do not constitute a "from web content" RCE.
+None of these constitutes a "from web content" RCE via the HTTP code cache path alone.
 
 ---
 
