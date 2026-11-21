@@ -343,7 +343,7 @@ async function chainB() {
       0x20,0x00,         // local.get 0
       0x20,0x01,         // local.get 1
       0xfb,0x00,0x00,    // struct.new type 0
-      0xfb,0x1a,         // extern.externalize
+      0xfb,0x1b,         // extern.convert_any (anyref→externref; 0x1b in this V8)
       0x0b,
   ]);
 
