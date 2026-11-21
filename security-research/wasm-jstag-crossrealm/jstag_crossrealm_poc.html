@@ -106,7 +106,8 @@
 //     call 0       ; $fn
 //     ref.null extern
 //   catch 0        ; $t
-//   end
+//   end            ; end try-catch
+//   end            ; end function
 const WASM_BYTES = new Uint8Array([
   /* header   */ 0x00,0x61,0x73,0x6d, 0x01,0x00,0x00,0x00,
   /* type     */ 0x01,0x0c, 0x03,
@@ -118,12 +119,13 @@ const WASM_BYTES = new Uint8Array([
                    0x01,0x6d, 0x02,0x66,0x6e, 0x00,0x00,
   /* function */ 0x03,0x02, 0x01,0x01,
   /* export   */ 0x07,0x07, 0x01, 0x03,0x72,0x75,0x6e, 0x00,0x01,
-  /* code     */ 0x0a,0x0c, 0x01, 0x0a,0x00,
+  /* code     */ 0x0a,0x0d, 0x01, 0x0b,0x00,
                    0x06,0x6f,       // try (result externref)
                    0x10,0x00,       // call $fn
                    0xd0,0x6f,       // ref.null extern
                    0x07,0x00,       // catch $t
-                   0x0b,            // end
+                   0x0b,            // end (try-catch)
+                   0x0b,            // end (function)
 ]);
 
 // ── Output helpers ────────────────────────────────────────────────────────────
