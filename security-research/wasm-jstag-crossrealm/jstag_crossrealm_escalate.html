@@ -379,7 +379,7 @@ async function chainB() {
       0x10,0x00,             // call $fn (func 0; tag import not in func space)
       0x42,0x00,             // i64.const 0
       0x07,0x00,             // catch $t
-      0xfb,0x1b,             // any.convert_extern (externref -> anyref)
+      0xfb,0x1a,             // any.convert_extern (externref -> anyref; 0x1a in this V8)
       0xfb,0x16,0x00,        // ref.cast (ref $B = type 0)
       0xfb,0x02,0x00,0x00,   // struct.get $B field 0
       0x0b,                  // end (try-catch)
