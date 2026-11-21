@@ -106,7 +106,8 @@
 //     call 0       ; $fn
 //     ref.null extern
 //   catch 0        ; $t
-//   end
+//   end            ; end try-catch
+//   end            ; end function
 const WASM_BYTES = new Uint8Array([
   /* header   */ 0x00,0x61,0x73,0x6d, 0x01,0x00,0x00,0x00,
   /* type     */ 0x01,0x0c, 0x03,

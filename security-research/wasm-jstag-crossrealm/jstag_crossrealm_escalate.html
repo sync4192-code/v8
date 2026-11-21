@@ -107,29 +107,7 @@ function makeLog(id) {
   };
 }
 
-// ── Wasm module: imports JSTag + thrower, exports run() -> externref ─────────
-// (module
-//   (import "m" "t"  (tag $t (param externref)))
-//   (import "m" "fn" (func $fn))
-//   (func (export "run") (result externref)
-//     try (result externref)
-//       call $fn
-//       ref.null extern
-//     catch $t
-//     end))
-const CATCHER_BYTES = new Uint8Array([
-  0x00,0x61,0x73,0x6d,0x01,0x00,0x00,0x00,
-  0x01,0x0c,0x03, 0x60,0x00,0x00, 0x60,0x00,0x01,0x6f, 0x60,0x01,0x6f,0x00,
-  0x02,0x0f,0x02,
-    0x01,0x6d,0x01,0x74,0x04,0x00,0x02,
-    0x01,0x6d,0x02,0x66,0x6e,0x00,0x00,
-  0x03,0x02,0x01,0x01,
-  0x07,0x07,0x01,0x03,0x72,0x75,0x6e,0x00,0x01,
-  0x0a,0x0c,0x01,0x0a,0x00,
-    0x06,0x6f, 0x10,0x00, 0xd0,0x6f, 0x07,0x00, 0x0b,
-]);
-
-// ── Wasm module B: imports JSTag + thrower, also passes caught value to
+// ── Wasm module: imports JSTag + thrower, also passes caught value to
 //   an imported JS callback — so we can observe what the handler receives ───
 // (module
 //   (import "m" "t"  (tag $t (param externref)))
@@ -141,6 +119,8 @@ const CATCHER_BYTES = new Uint8Array([
 //     catch $t
 //       call $cb   ; pass caught externref to JS callback
 //     end))
+//
+// func space: fn=0, cb=1, run=2  (tag import NOT in func space)
 const OBSERVER_BYTES = new Uint8Array([
   0x00,0x61,0x73,0x6d,0x01,0x00,0x00,0x00,
   // types: () -> (), () -> (), (externref) -> (), (externref) -> ()
